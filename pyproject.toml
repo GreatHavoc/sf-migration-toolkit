@@ -1,0 +1,10 @@
+[project]
+name = "snowflake-migrate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "snowflake-connector-python>=4.1.1",
+    "streamlit>=1.52.2",
+]

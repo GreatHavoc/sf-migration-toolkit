@@ -250,7 +250,7 @@ ALTER STAGE {fq(mig_db, mig_schema, stage_name)} SET
 
 def list_stage(conn, mig_db: str, mig_schema: str, stage_name: str):
     ensure_session_namespace(conn, mig_db, mig_schema)
-    return exec_sql(conn, f"LIST @{qident(stage_name)}")
+    return exec_sql(conn, f"LIST @{mig_db}.{mig_schema}.{stage_name}")
 
 
 # ----------------------------
@@ -591,6 +591,98 @@ def migrate_notebooks_fully_automated(
 
 
 # ----------------------------
+# Stage file helpers (backup / restore files inside user-created stages)
+# ----------------------------
+def list_user_stages(conn, db: str, schema: str) -> list[dict]:
+    """Return metadata for non-temporary, non-managed stages in a schema."""
+    cols, rows = exec_sql_with_cols(conn, f"SHOW STAGES IN SCHEMA {fq(db, schema)}")
+    i_name = _find_col(cols, "name")
+    i_type = _find_col(cols, "type")
+    i_url = _find_col(cols, "url")
+    if i_name is None:
+        return []
+    out = []
+    for r in rows:
+        name = r[i_name] if len(r) > i_name else None
+        if not name:
+            continue
+        stype = (r[i_type] if (i_type is not None and len(r) > i_type) else "") or ""
+        url = (r[i_url] if (i_url is not None and len(r) > i_url) else "") or ""
+        out.append({"name": str(name), "type": str(stype).upper(), "url": str(url)})
+    return out
+
+
+def list_stage_files(conn, db: str, schema: str, stage_name: str) -> list[str]:
+    """LIST files on a stage and return file paths relative to the stage root."""
+    ensure_session_namespace(conn, db, schema)
+    try:
+        rows = exec_sql(conn, f"LIST @{fq(db, schema, stage_name)}")
+    except Exception:
+        return []
+    # Column 0 is the fully-qualified path like '<stage>/path/file.csv.gz'
+    # We strip the stage prefix to get relative paths.
+    prefix = f"{stage_name.lower()}/"
+    files = []
+    for r in rows:
+        if not r or not r[0]:
+            continue
+        f_path = str(r[0])
+        # Strip the leading stage reference that Snowflake prepends
+        # e.g. "my_stage/sub/file.csv" -> "sub/file.csv"
+        low = f_path.lower()
+        if low.startswith(prefix):
+            f_path = f_path[len(prefix):]
+        files.append(f_path)
+    return files
+
+
+def get_stage_ddl(conn, db: str, schema: str, stage_name: str) -> Optional[str]:
+    """Get DDL for a stage via GET_DDL."""
+    try:
+        return fetch_one_val(
+            conn,
+            "SELECT GET_DDL('STAGE', %(n)s, TRUE)",
+            {"n": f"{db}.{schema}.{stage_name}"},
+        )
+    except Exception:
+        return None
+
+
+def get_stage_files_to_local(conn, db: str, schema: str, stage_name: str, local_dir: str) -> list[str]:
+    """Download all files from a stage to a local directory via GET. Returns list of local file paths."""
+    os.makedirs(local_dir, exist_ok=True)
+    stage_fq = f"@{fq(db, schema, stage_name)}"
+    sql = f"GET {sql_string_literal(stage_fq)} {sql_string_literal(_to_file_uri(local_dir))} OVERWRITE=TRUE;"
+    try:
+        exec_sql(conn, sql)
+    except Exception:
+        return []
+    # Walk the local dir and return all downloaded files
+    downloaded = []
+    for root, _dirs, fnames in os.walk(local_dir):
+        for fn in fnames:
+            downloaded.append(os.path.join(root, fn))
+    return downloaded
+
+
+def put_local_dir_to_stage(conn, local_dir: str, db: str, schema: str, stage_name: str):
+    """Upload all files from a local directory to a stage via PUT."""
+    stage_fq = f"@{fq(db, schema, stage_name)}"
+    for root, _dirs, fnames in os.walk(local_dir):
+        for fn in fnames:
+            local_file = os.path.join(root, fn)
+            # Compute the relative sub-path to preserve folder structure inside the stage
+            rel = os.path.relpath(local_file, local_dir).replace("\\", "/")
+            sub_dir = os.path.dirname(rel)
+            target = f"{stage_fq}/{sub_dir}/" if sub_dir and sub_dir != "." else f"{stage_fq}/"
+            sql = (
+                f"PUT {sql_string_literal(_to_file_uri(local_file))} "
+                f"{target} OVERWRITE=TRUE AUTO_COMPRESS=FALSE;"
+            )
+            exec_sql(conn, sql)
+
+
+# ----------------------------
 # Local Backup & Restore helpers
 # ----------------------------
 def _to_file_uri(local_path: str) -> str:
@@ -624,7 +716,8 @@ def run_local_backup(
     do_streamlits: bool,
     do_notebooks: bool,
     do_data: bool,
-    dry_run: bool,
+    do_stage_files: bool = False,
+    dry_run: bool = False,
 ):
     """Export selected schemas from a Snowflake database to a local directory."""
     base = os.path.join(backup_root, run_id, src_db)
@@ -641,7 +734,7 @@ def run_local_backup(
     for sch in schemas:
         st.subheader(f"Backup: {src_db}.{sch}")
         sdir = os.path.join(base, sch)
-        smeta: dict = {"tables": [], "semantic_views": [], "agents": [], "streamlits": [], "notebooks": []}
+        smeta: dict = {"tables": [], "semantic_views": [], "agents": [], "streamlits": [], "notebooks": [], "stages": []}
 
         # ---- schema DDL ----
         if do_ddl:
@@ -695,6 +788,31 @@ def run_local_backup(
                     get_notebook_ipynb_to_local(conn, src_db, sch, nb, nb_dir)
                 smeta["notebooks"].append(nb_meta)
             st.success(f"Notebooks backed up: {len(nbs)}")
+
+        # ---- stage files (user-created stages) ----
+        if do_stage_files:
+            stages = list_user_stages(conn, src_db, sch)
+            backed = 0
+            for stg_meta in stages:
+                stg_name = stg_meta["name"]
+                stg_type = stg_meta["type"]
+                # Only back up internal stages (we can GET from them); external stages hold
+                # data outside Snowflake so there's nothing to download.
+                if "INTERNAL" not in stg_type:
+                    st.info(f"  Stage {stg_name}: type={stg_type} — skipping (external).")
+                    smeta["stages"].append({"name": stg_name, "type": stg_type, "files_backed_up": False})
+                    continue
+                stg_ddl = get_stage_ddl(conn, src_db, sch, stg_name)
+                stg_dir = os.path.join(sdir, "stages", stg_name)
+                if not dry_run:
+                    if stg_ddl:
+                        _write_local(os.path.join(sdir, "stages", f"{stg_name}.ddl.sql"), stg_ddl)
+                    files_dir = os.path.join(stg_dir, "files")
+                    downloaded = get_stage_files_to_local(conn, src_db, sch, stg_name, files_dir)
+                    st.write(f"  Stage {stg_name}: {len(downloaded)} files downloaded.")
+                smeta["stages"].append({"name": stg_name, "type": stg_type, "files_backed_up": True})
+                backed += 1
+            st.success(f"Stage files backed up: {backed}/{len(stages)} stages")
 
         # ---- table data via internal stage -> GET -> local ----
         if do_data:
@@ -753,10 +871,11 @@ def run_local_restore(
     do_streamlits: bool,
     do_notebooks: bool,
     do_data: bool,
-    rewrite_db: bool,
-    init_streamlit_live: bool,
-    tgt_query_wh: Optional[str],
-    dry_run: bool,
+    do_stage_files: bool = False,
+    rewrite_db: bool = True,
+    init_streamlit_live: bool = True,
+    tgt_query_wh: Optional[str] = None,
+    dry_run: bool = False,
 ):
     """Import schemas from a local backup directory into a Snowflake account."""
     manifest_file = os.path.join(backup_path, "manifest.json")
@@ -874,6 +993,40 @@ def run_local_restore(
                         exec_sql(conn, sql)
                     count += 1
             st.success(f"Notebooks restored: {count}")
+
+        # ---- stage files ----
+        if do_stage_files:
+            stg_list = smeta.get("stages", [])
+            count = 0
+            for stg_info in stg_list:
+                stg_name = stg_info["name"]
+                if not stg_info.get("files_backed_up", False):
+                    st.info(f"  Stage {stg_name}: no files to restore (external or empty).")
+                    continue
+                stg_ddl_file = os.path.join(sdir, "stages", f"{stg_name}.ddl.sql")
+                stg_files_dir = os.path.join(sdir, "stages", stg_name, "files")
+
+                # Re-create the stage from saved DDL (or CREATE STAGE IF NOT EXISTS)
+                if not dry_run:
+                    if os.path.isfile(stg_ddl_file):
+                        ddl = _read_local(stg_ddl_file)
+                        if rewrite_db and tgt_db != src_db:
+                            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+                        try:
+                            exec_script(conn, ddl, remove_comments=True)
+                        except Exception as e:
+                            st.warning(f"  Stage {stg_name} DDL failed ({e}), creating fallback.")
+                            exec_sql(conn, f"CREATE STAGE IF NOT EXISTS {fq(tgt_db, tgt_schema, stg_name)}")
+                    else:
+                        exec_sql(conn, f"CREATE STAGE IF NOT EXISTS {fq(tgt_db, tgt_schema, stg_name)}")
+
+                    # Upload files back to the stage
+                    if os.path.isdir(stg_files_dir):
+                        put_local_dir_to_stage(conn, stg_files_dir, tgt_db, tgt_schema, stg_name)
+
+                count += 1
+                st.write(f"  Stage {stg_name}: restored.")
+            st.success(f"Stage files restored: {count}")
 
         # ---- table data via local -> PUT -> COPY INTO ----
         if do_data:
@@ -1064,7 +1217,7 @@ with local_bk_tab:
             key="bk_schemas",
         )
 
-        bk_c1, bk_c2, bk_c3, bk_c4, bk_c5, bk_c6 = st.columns(6)
+        bk_c1, bk_c2, bk_c3, bk_c4, bk_c5, bk_c6, bk_c7 = st.columns(7)
         with bk_c1:
             bk_ddl = st.checkbox("Schema DDL", value=True, key="bk_ddl")
         with bk_c2:
@@ -1077,6 +1230,8 @@ with local_bk_tab:
             bk_nb = st.checkbox("Notebooks", value=True, key="bk_nb")
         with bk_c6:
             bk_data = st.checkbox("Table data", value=True, key="bk_data")
+        with bk_c7:
+            bk_stg = st.checkbox("Stage files", value=True, key="bk_stg")
         bk_dry = st.checkbox("Dry run", value=False, key="bk_dry")
 
         if st.button("Run Backup Now"):
@@ -1101,6 +1256,7 @@ with local_bk_tab:
                         do_streamlits=bk_sl,
                         do_notebooks=bk_nb,
                         do_data=bk_data,
+                        do_stage_files=bk_stg,
                         dry_run=bk_dry,
                     )
                 except Exception as e:
@@ -1121,7 +1277,7 @@ with local_rs_tab:
         rs_tgt_db = st.text_input("Target database name", value="", key="rs_tgt_db")
         rs_int_stage = st.text_input("Internal stage (created on target)", value=DEFAULT_LOCAL_INT_STAGE, key="rs_stage")
 
-        rs_c1, rs_c2, rs_c3, rs_c4, rs_c5, rs_c6 = st.columns(6)
+        rs_c1, rs_c2, rs_c3, rs_c4, rs_c5, rs_c6, rs_c7 = st.columns(7)
         with rs_c1:
             rs_ddl = st.checkbox("Schema DDL", value=True, key="rs_ddl")
         with rs_c2:
@@ -1134,6 +1290,8 @@ with local_rs_tab:
             rs_nb = st.checkbox("Notebooks", value=True, key="rs_nb")
         with rs_c6:
             rs_data = st.checkbox("Table data", value=True, key="rs_data")
+        with rs_c7:
+            rs_stg = st.checkbox("Stage files", value=True, key="rs_stg")
 
         rs_rewrite = st.checkbox("Rewrite DB name in DDL", value=True, key="rs_rewrite")
         rs_sl_live = st.checkbox("Init Streamlit LIVE version", value=True, key="rs_sl_live")
@@ -1159,6 +1317,7 @@ with local_rs_tab:
                         do_streamlits=rs_sl,
                         do_notebooks=rs_nb,
                         do_data=rs_data,
+                        do_stage_files=rs_stg,
                         rewrite_db=rs_rewrite,
                         init_streamlit_live=rs_sl_live,
                         tgt_query_wh=tgt_wh or None,

@@ -181,61 +181,14 @@ def describe_stage(conn, db: str, schema: str, stage: str) -> dict:
 # ----------------------------
 # Azure external stage: always-latest ensure
 # ----------------------------
-
-def _validate_azure_storage_account(storage_account: str):
-    # Azure storage account names must be 3-24 chars, lowercase letters and numbers only.
-    if not re.fullmatch(r"[a-z0-9]{3,24}", storage_account or ""):
-        raise ValueError(
-            "Azure storage account name must be 3-24 characters, lowercase letters and numbers only."
-        )
-
-
-def _validate_azure_container_name(container: str):
-    # Azure container names must be 3-63 chars, lowercase letters/numbers/hyphens, start/end with letter/number.
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?", container or ""):
-        raise ValueError(
-            "Azure container name must be 3-63 characters, all lowercase letters/numbers/hyphens, and start/end with a letter or number."
-        )
-
-
 def normalize_prefix(prefix: str) -> str:
-    p = (prefix or "").strip()
-    if not p:
-        return ""
-
-    if "\\" in p or " " in p:
-        raise ValueError("Azure prefix must not contain spaces or backslashes.")
-    if "//" in p:
-        raise ValueError("Azure prefix must not contain consecutive slashes (//).")
-
-    p = p.lstrip("/")
+    p = (prefix or "").strip().lstrip("/")
     if p and not p.endswith("/"):
         p += "/"
     return p
 
 
-def _normalize_stage_url(stage_url: str) -> str:
-    """Normalize common stage URL quoting/serialization artifacts.
-
-    Some UI/JSON paths can wrap the URL in brackets or quotes (e.g. `["azure://..."]`).
-    This normalizer strips those so the URL can be validated/used correctly.
-    """
-    u = (stage_url or "").strip()
-
-    # Strip list syntax: ["..."] or ['...']
-    if u.startswith("[") and u.endswith("]"):
-        u = u[1:-1].strip()
-
-    # Strip enclosing quotes
-    if (u.startswith('"') and u.endswith('"')) or (u.startswith("'") and u.endswith("'")):
-        u = u[1:-1]
-
-    return u.strip()
-
-
 def build_azure_stage_url(storage_account: str, container: str, prefix: str) -> str:
-    _validate_azure_storage_account(storage_account)
-    _validate_azure_container_name(container)
     p = normalize_prefix(prefix)
     return f"azure://{storage_account}.blob.core.windows.net/{container}/{p}"
 
@@ -266,22 +219,8 @@ ALTER STORAGE INTEGRATION {qident(integration_name)} SET
 def ensure_external_stage_azure(conn, mig_db: str, mig_schema: str, stage_name: str, stage_url: str, integration_name: str):
     bootstrap_db_schema(conn, mig_db, mig_schema)
 
-    # Normalize common quoting/serialization artifacts (e.g. ["azure://..."]).
-    stage_url = _normalize_stage_url(stage_url)
-
     if not stage_url.strip() or stage_url.strip().lower() == "azure://.blob.core.windows.net//":
         raise ValueError("Stage URL is empty/invalid. Fill storage account + container + prefix first.")
-
-    # Validate the stage URL structure early so we can show a helpful error message.
-    m = re.match(r"^azure://([a-z0-9]+)\.blob\.core\.windows\.net/([^/]+)/(.*)$", stage_url)
-    if not m:
-        raise ValueError(
-            "Stage URL seems malformed. Expected: azure://<account>.blob.core.windows.net/<container>/<prefix>/"
-        )
-    acct, container, prefix = m.group(1), m.group(2), m.group(3)
-    _validate_azure_storage_account(acct)
-    _validate_azure_container_name(container)
-    normalize_prefix(prefix)
 
     props = describe_stage(conn, mig_db, mig_schema, stage_name)
     stage_exists = bool(props)
@@ -1240,12 +1179,7 @@ _src_status = "\u2705 Source connected" if src_conn else "\u274c Source not conn
 _tgt_status = "\u2705 Target connected" if tgt_conn else "\u274c Target not connected"
 st.caption(f"{_src_status}  |  {_tgt_status}")
 
-# Compute the Azure stage URL (may be invalid until inputs are filled)
-try:
-    stage_url = build_azure_stage_url(storage_account, container, prefix)
-except Exception as e:
-    stage_url = ""
-    st.error(f"Azure stage URL invalid: {e}")
+stage_url = build_azure_stage_url(storage_account, container, prefix)
 
 st.divider()
 

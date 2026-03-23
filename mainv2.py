@@ -338,6 +338,102 @@ def migrate_semantic_views(
 
 
 # ----------------------------
+# Regular views migration
+# ----------------------------
+def list_views(conn, db: str, schema: str) -> list[str]:
+    cols, rows = exec_sql_with_cols(conn, f"SHOW VIEWS IN SCHEMA {fq(db, schema)}")
+    i_name = _find_col(cols, "name")
+    if i_name is None:
+        return []
+    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
+
+
+def get_view_ddl(conn, db: str, schema: str, view_name: str) -> Optional[str]:
+    try:
+        return fetch_one_val(
+            conn,
+            "SELECT GET_DDL('VIEW', %(n)s, TRUE)",
+            {"n": f"{db}.{schema}.{view_name}"},
+        )
+    except Exception:
+        return None
+
+
+def _extract_view_refs(ddl: str) -> set[str]:
+    # crude parser: find occurrences of schema.object or db.schema.object and plain object names
+    refs = set()
+    if not ddl:
+        return refs
+    # db.schema.object
+    for m in re.findall(r"\b([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\b", ddl):
+        refs.add(m[2])
+    # schema.object
+    for m in re.findall(r"\b([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\b", ddl):
+        refs.add(m[1])
+    return refs
+
+
+def resolve_view_order(view_names: list[str], ddls: dict[str, str]) -> list[str]:
+    # Build dependency graph among views in the same schema and topologically sort.
+    deps = {v: set() for v in view_names}
+    name_set = set(view_names)
+    for v in view_names:
+        ddl = ddls.get(v) or ""
+        refs = _extract_view_refs(ddl)
+        for r in refs:
+            if r in name_set and r != v:
+                deps[v].add(r)
+
+    # Kahn's algorithm
+    indeg = {v: 0 for v in view_names}
+    for v, ds in deps.items():
+        for d in ds:
+            indeg[d] += 1
+
+    q = [v for v, d in indeg.items() if d == 0]
+    order = []
+    while q:
+        n = q.pop(0)
+        order.append(n)
+        for m in view_names:
+            if n in deps.get(m, set()):
+                indeg[m] -= 1
+                deps[m].discard(n)
+                if indeg[m] == 0:
+                    q.append(m)
+
+    if len(order) != len(view_names):
+        # cycle detected — fall back to original list but preserve as best-effort
+        return view_names
+    return order
+
+
+def migrate_views(
+    src_conn, tgt_conn,
+    src_db: str, src_schema: str,
+    tgt_db: str, tgt_schema: str,
+    dry_run: bool, rewrite_db: bool
+):
+    views = list_views(src_conn, src_db, src_schema)
+    if not views:
+        return
+    ddls = {}
+    for v in views:
+        ddl = get_view_ddl(src_conn, src_db, src_schema, v) or ""
+        if rewrite_db and tgt_db != src_db:
+            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+        ddls[v] = ddl
+
+    order = resolve_view_order(views, ddls)
+    for v in order:
+        ddl = ddls.get(v) or ""
+        if not ddl:
+            continue
+        if not dry_run:
+            exec_script(tgt_conn, ddl, remove_comments=True)
+
+
+# ----------------------------
 # Cortex Agents migration (SQL)
 # ----------------------------
 def list_agents(conn, db: str, schema: str) -> list[str]:
@@ -717,6 +813,7 @@ def run_local_backup(
     do_notebooks: bool,
     do_data: bool,
     do_stage_files: bool = False,
+    do_views: bool = False,
     dry_run: bool = False,
 ):
     """Export selected schemas from a Snowflake database to a local directory."""
@@ -755,6 +852,16 @@ def run_local_backup(
                     _write_local(os.path.join(sdir, "semantic_views", f"{sv}.sql"), sv_ddl)
                 smeta["semantic_views"].append(sv)
             st.success(f"Semantic views backed up: {len(svs)}")
+
+            # ---- regular views ----
+            if do_views:
+                views = list_views(conn, src_db, sch)
+                for v in views:
+                    v_ddl = get_view_ddl(conn, src_db, sch, v)
+                    if v_ddl and not dry_run:
+                        _write_local(os.path.join(sdir, "views", f"{v}.sql"), v_ddl)
+                    smeta.setdefault("views", []).append(v)
+                st.success(f"Views backed up: {len(views)}")
 
         # ---- agents ----
         if do_agents:
@@ -872,6 +979,7 @@ def run_local_restore(
     do_notebooks: bool,
     do_data: bool,
     do_stage_files: bool = False,
+    do_views: bool = False,
     rewrite_db: bool = True,
     init_streamlit_live: bool = True,
     tgt_query_wh: Optional[str] = None,
@@ -967,6 +1075,37 @@ def run_local_restore(
                                 pass
                     count += 1
             st.success(f"Streamlits restored: {count}")
+
+        # ---- regular views ----
+        if do_views:
+            views_dir = os.path.join(sdir, "views")
+            count = 0
+            view_ddls = {}
+            if os.path.isdir(views_dir):
+                for f in sorted(os.listdir(views_dir)):
+                    if not f.endswith('.sql'):
+                        continue
+                    name = f[:-4]
+                    ddl = _read_local(os.path.join(views_dir, f))
+                    if rewrite_db and tgt_db != src_db:
+                        ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+                    view_ddls[name] = ddl
+                    count += 1
+
+            # Resolve order and apply
+            if view_ddls:
+                order = resolve_view_order(list(view_ddls.keys()), view_ddls)
+                for vn in order:
+                    ddl = view_ddls.get(vn) or ""
+                    if not ddl:
+                        continue
+                    if not dry_run:
+                        try:
+                            exec_script(conn, ddl, remove_comments=True)
+                        except Exception as e:
+                            st.warning(f"View {vn} DDL failed: {e}")
+
+            st.success(f"Views restored: {count}")
 
         # ---- notebooks ----
         if do_notebooks:
@@ -1217,20 +1356,22 @@ with local_bk_tab:
             key="bk_schemas",
         )
 
-        bk_c1, bk_c2, bk_c3, bk_c4, bk_c5, bk_c6, bk_c7 = st.columns(7)
+        bk_c1, bk_c2, bk_c3, bk_c4, bk_c5, bk_c6, bk_c7, bk_c8 = st.columns(8)
         with bk_c1:
             bk_ddl = st.checkbox("Schema DDL", value=True, key="bk_ddl")
         with bk_c2:
-            bk_sv = st.checkbox("Semantic views", value=True, key="bk_sv")
+            bk_views = st.checkbox("Views", value=True, key="bk_views")
         with bk_c3:
-            bk_ag = st.checkbox("Agents", value=True, key="bk_ag")
+            bk_sv = st.checkbox("Semantic views", value=True, key="bk_sv")
         with bk_c4:
-            bk_sl = st.checkbox("Streamlits", value=True, key="bk_sl")
+            bk_ag = st.checkbox("Agents", value=True, key="bk_ag")
         with bk_c5:
-            bk_nb = st.checkbox("Notebooks", value=True, key="bk_nb")
+            bk_sl = st.checkbox("Streamlits", value=True, key="bk_sl")
         with bk_c6:
-            bk_data = st.checkbox("Table data", value=True, key="bk_data")
+            bk_nb = st.checkbox("Notebooks", value=True, key="bk_nb")
         with bk_c7:
+            bk_data = st.checkbox("Table data", value=True, key="bk_data")
+        with bk_c8:
             bk_stg = st.checkbox("Stage files", value=True, key="bk_stg")
         bk_dry = st.checkbox("Dry run", value=False, key="bk_dry")
 
@@ -1251,6 +1392,7 @@ with local_bk_tab:
                         int_stage_name=bk_int_stage,
                         run_id=actual_run_id,
                         do_ddl=bk_ddl,
+                        do_views=bk_views,
                         do_semantic=bk_sv,
                         do_agents=bk_ag,
                         do_streamlits=bk_sl,
@@ -1277,20 +1419,22 @@ with local_rs_tab:
         rs_tgt_db = st.text_input("Target database name", value="", key="rs_tgt_db")
         rs_int_stage = st.text_input("Internal stage (created on target)", value=DEFAULT_LOCAL_INT_STAGE, key="rs_stage")
 
-        rs_c1, rs_c2, rs_c3, rs_c4, rs_c5, rs_c6, rs_c7 = st.columns(7)
+        rs_c1, rs_c2, rs_c3, rs_c4, rs_c5, rs_c6, rs_c7, rs_c8 = st.columns(8)
         with rs_c1:
             rs_ddl = st.checkbox("Schema DDL", value=True, key="rs_ddl")
         with rs_c2:
-            rs_sv = st.checkbox("Semantic views", value=True, key="rs_sv")
+            rs_views = st.checkbox("Views", value=True, key="rs_views")
         with rs_c3:
-            rs_ag = st.checkbox("Agents", value=True, key="rs_ag")
+            rs_sv = st.checkbox("Semantic views", value=True, key="rs_sv")
         with rs_c4:
-            rs_sl = st.checkbox("Streamlits", value=True, key="rs_sl")
+            rs_ag = st.checkbox("Agents", value=True, key="rs_ag")
         with rs_c5:
-            rs_nb = st.checkbox("Notebooks", value=True, key="rs_nb")
+            rs_sl = st.checkbox("Streamlits", value=True, key="rs_sl")
         with rs_c6:
-            rs_data = st.checkbox("Table data", value=True, key="rs_data")
+            rs_nb = st.checkbox("Notebooks", value=True, key="rs_nb")
         with rs_c7:
+            rs_data = st.checkbox("Table data", value=True, key="rs_data")
+        with rs_c8:
             rs_stg = st.checkbox("Stage files", value=True, key="rs_stg")
 
         rs_rewrite = st.checkbox("Rewrite DB name in DDL", value=True, key="rs_rewrite")
@@ -1312,6 +1456,7 @@ with local_rs_tab:
                         mig_schema=mig_schema,
                         int_stage_name=rs_int_stage,
                         do_ddl=rs_ddl,
+                        do_views=rs_views,
                         do_semantic=rs_sv,
                         do_agents=rs_ag,
                         do_streamlits=rs_sl,
@@ -1436,20 +1581,22 @@ selected_schemas = st.multiselect(
 
 tgt_db = st.text_input("Target database name", value=src_db)
 
-col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
 with col1:
     migrate_ddl = st.checkbox("Migrate schema DDL", value=True)
 with col2:
-    migrate_semantic = st.checkbox("Migrate semantic views", value=True)
+    migrate_views_flag = st.checkbox("Migrate Views", value=True)
 with col3:
-    migrate_agents_flag = st.checkbox("Migrate Cortex Agents", value=True)
+    migrate_semantic = st.checkbox("Migrate semantic views", value=True)
 with col4:
-    migrate_streamlits_flag = st.checkbox("Migrate Streamlit apps", value=True)
+    migrate_agents_flag = st.checkbox("Migrate Cortex Agents", value=True)
 with col5:
-    migrate_notebooks_flag = st.checkbox("Migrate Notebooks (GET->PUT->CREATE)", value=True)
+    migrate_streamlits_flag = st.checkbox("Migrate Streamlit apps", value=True)
 with col6:
-    copy_data = st.checkbox("Copy data (CSV+GZIP)", value=True)
+    migrate_notebooks_flag = st.checkbox("Migrate Notebooks (GET->PUT->CREATE)", value=True)
 with col7:
+    copy_data = st.checkbox("Copy data (CSV+GZIP)", value=True)
+with col8:
     dry_run = st.checkbox("Dry run", value=False)
 
 rewrite_db = st.checkbox("Rewrite DB name inside DDL/specs when target DB differs", value=True)
@@ -1513,6 +1660,20 @@ if st.button("Run migration now"):
             exec_script(tgt_conn, ddl_clean, remove_comments=True)
 
         # --- Semantic views
+        # --- Views
+        if 'migrate_views_flag' in locals() and migrate_views_flag:
+            try:
+                migrate_views(
+                    src_conn, tgt_conn,
+                    src_db, sch,
+                    tgt_db, tgt_schema,
+                    dry_run=dry_run,
+                    rewrite_db=rewrite_db,
+                )
+                st.success("Views migrated.")
+            except Exception as e:
+                st.error(f"Views migration failed: {e}")
+
         if migrate_semantic:
             try:
                 migrate_semantic_views(

@@ -1,438 +1,52 @@
-import re
 import uuid
-from io import StringIO
-from typing import Optional
+import os
+import tempfile
 
 import streamlit as st
-import snowflake.connector
 
-
-# ----------------------------
-# Constants
-# ----------------------------
-SKIP_SCHEMAS = {"INFORMATION_SCHEMA"}
-
-DEFAULT_MIG_DB = "MIGRATION_DB"
-DEFAULT_MIG_SCHEMA = "PUBLIC"
-DEFAULT_STAGE = "MIGRATION_STAGE"
-DEFAULT_INTEGRATION = "AZURE_MIGRATION_INT"
-
-
-# ----------------------------
-# Snowflake helpers
-# ----------------------------
-def connect_sf(account, user, password, role=None, warehouse=None):
-    kwargs = dict(
-        account=account,
-        user=user,
-        password=password,
-        client_session_keep_alive=True,
-    )
-    if role:
-        kwargs["role"] = role
-    if warehouse:
-        kwargs["warehouse"] = warehouse
-    return snowflake.connector.connect(**kwargs)
-
-
-def exec_sql(conn, sql, params=None):
-    with conn.cursor() as cur:
-        cur.execute(sql, params or {})
-        try:
-            return cur.fetchall()
-        except Exception:
-            return []
-
-
-def exec_sql_with_cols(conn, sql, params=None):
-    with conn.cursor() as cur:
-        cur.execute(sql, params or {})
-        cols = [d[0] for d in (cur.description or [])]
-        try:
-            rows = cur.fetchall()
-        except Exception:
-            rows = []
-        return cols, rows
-
-
-def fetch_one_val(conn, sql, params=None):
-    rows = exec_sql(conn, sql, params)
-    return rows[0][0] if rows else None
-
-
-def exec_script(conn, sql_text, remove_comments=True):
-    sql_stream = StringIO(sql_text)
-    for _cur in conn.execute_stream(sql_stream, remove_comments=remove_comments):
-        pass
-
-
-def qident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def fq(db: str, schema: str, obj: str | None = None) -> str:
-    if obj is None:
-        return f"{qident(db)}.{qident(schema)}"
-    return f"{qident(db)}.{qident(schema)}.{qident(obj)}"
-
-
-def ensure_session_namespace(conn, db: str, schema: str):
-    exec_sql(conn, f"USE DATABASE {qident(db)}")
-    exec_sql(conn, f"USE SCHEMA {fq(db, schema)}")
-
-
-def bootstrap_db_schema(conn, mig_db: str, mig_schema: str):
-    exec_sql(conn, f"CREATE DATABASE IF NOT EXISTS {qident(mig_db)}")
-    exec_sql(conn, f"CREATE SCHEMA IF NOT EXISTS {fq(mig_db, mig_schema)}")
-    ensure_session_namespace(conn, mig_db, mig_schema)
-
-
-def _find_col(cols, *candidates):
-    low = [c.lower() for c in cols]
-    for cand in candidates:
-        cand = cand.lower()
-        if cand in low:
-            return low.index(cand)
-    return None
-
-
-def _escape_sql_string(v: str) -> str:
-    return v.replace("'", "''")
-
-
-def sql_string_literal(s: str) -> str:
-    return "'" + (s or "").replace("'", "''") + "'"
-
-
-def stage_loc_literal(loc: str) -> str:
-    """
-    Wrap stage locations in single quotes to safely handle spaces/special chars in the path. [COPY INTO notes]
-    Works for @stage/path as well as external URLs if used later.
-    """
-    loc = (loc or "").strip()
-    if not loc:
-        return loc
-    if loc.startswith("@") or "://" in loc:
-        return sql_string_literal(loc)
-    return loc
-
-
-def strip_streamlit_from_schema_ddl(schema_ddl: str) -> str:
-    """
-    Schema-level GET_DDL('SCHEMA', ...) can include CREATE STREAMLIT statements that may compile-bomb
-    (e.g. older outputs that append /versions/live into the identifier).
-    We migrate Streamlit apps separately via GET_DDL('STREAMLIT', ...). [CREATE STREAMLIT docs]
-    """
-    return re.sub(
-        r"(?is)\bcreate\s+(or\s+replace\s+)?streamlit\b.*?;\s*",
-        "",
-        schema_ddl,
-    )
-
-
-# ----------------------------
-# DESC parsing
-# ----------------------------
-def desc_storage_integration_to_dict(rows) -> dict:
-    out = {}
-    for r in rows:
-        if len(r) >= 3:
-            out[str(r[0]).upper()] = r[2]
-    return out
-
-
-def desc_stage_to_dict(rows) -> dict:
-    out = {}
-    for r in rows:
-        if len(r) >= 4:
-            prop = str(r[1]).upper()
-            val = r[3]
-            out[prop] = val
-    return out
-
-
-def describe_storage_integration(conn, integration_name: str) -> dict:
-    rows = exec_sql(conn, f"DESC STORAGE INTEGRATION {qident(integration_name)}")
-    return desc_storage_integration_to_dict(rows)
-
-
-def describe_stage(conn, db: str, schema: str, stage: str) -> dict:
-    try:
-        rows = exec_sql(conn, f"DESC STAGE {fq(db, schema, stage)}")
-        return desc_stage_to_dict(rows)
-    except Exception:
-        return {}
-
-
-# ----------------------------
-# Azure external stage: always-latest ensure
-# ----------------------------
-def normalize_prefix(prefix: str) -> str:
-    p = (prefix or "").strip().lstrip("/")
-    if p and not p.endswith("/"):
-        p += "/"
-    return p
-
-
-def build_azure_stage_url(storage_account: str, container: str, prefix: str) -> str:
-    p = normalize_prefix(prefix)
-    return f"azure://{storage_account}.blob.core.windows.net/{container}/{p}"
-
-
-def ensure_storage_integration_azure(conn, integration_name: str, tenant_id: str, allowed_locations: list[str]):
-    if not tenant_id.strip():
-        raise ValueError("Azure tenant id is required.")
-    allowed_sql = ", ".join(f"'{loc}'" for loc in allowed_locations if loc.strip())
-    if not allowed_sql:
-        raise ValueError("At least one STORAGE_ALLOWED_LOCATIONS entry is required.")
-
-    exec_sql(conn, f"""
-CREATE STORAGE INTEGRATION IF NOT EXISTS {qident(integration_name)}
-  TYPE = EXTERNAL_STAGE
-  STORAGE_PROVIDER = 'AZURE'
-  ENABLED = TRUE
-  AZURE_TENANT_ID = '{tenant_id}'
-  STORAGE_ALLOWED_LOCATIONS = ({allowed_sql});
-""".strip())
-
-    exec_sql(conn, f"""
-ALTER STORAGE INTEGRATION {qident(integration_name)} SET
-  ENABLED = TRUE
-  STORAGE_ALLOWED_LOCATIONS = ({allowed_sql});
-""".strip())
-
-
-def ensure_external_stage_azure(conn, mig_db: str, mig_schema: str, stage_name: str, stage_url: str, integration_name: str):
-    bootstrap_db_schema(conn, mig_db, mig_schema)
-
-    if not stage_url.strip() or stage_url.strip().lower() == "azure://.blob.core.windows.net//":
-        raise ValueError("Stage URL is empty/invalid. Fill storage account + container + prefix first.")
-
-    props = describe_stage(conn, mig_db, mig_schema, stage_name)
-    stage_exists = bool(props)
-
-    existing_url = (props.get("URL") or "").strip()
-    existing_integration = (props.get("STORAGE_INTEGRATION") or "").strip()
-
-    is_internal_like = stage_exists and existing_url == "" and existing_integration == ""
-
-    if (not stage_exists) or is_internal_like or (existing_url and existing_url != stage_url) or (
-        existing_integration and existing_integration.upper() != integration_name.upper()
-    ):
-        exec_sql(conn, f"DROP STAGE IF EXISTS {fq(mig_db, mig_schema, stage_name)}")
-        exec_sql(conn, f"""
-CREATE STAGE {fq(mig_db, mig_schema, stage_name)}
-  URL = '{stage_url}'
-  STORAGE_INTEGRATION = {qident(integration_name)};
-""".strip())
-        return
-
-    exec_sql(conn, f"""
-ALTER STAGE {fq(mig_db, mig_schema, stage_name)} SET
-  URL = '{stage_url}'
-  STORAGE_INTEGRATION = {qident(integration_name)};
-""".strip())
-
-
-def list_stage(conn, mig_db: str, mig_schema: str, stage_name: str):
-    ensure_session_namespace(conn, mig_db, mig_schema)
-    return exec_sql(conn, f"LIST @{qident(stage_name)}")
-
-
-# ----------------------------
-# CSV copy (stable column order)
-# ----------------------------
-def get_table_columns(conn, db: str, schema: str, table: str) -> list[str]:
-    rows = exec_sql(conn, f"DESC TABLE {fq(db, schema, table)}")
-    cols = []
-    for r in rows:
-        if r and r[0]:
-            cols.append(r[0])
-    return cols
-
-
-def build_csv_unload_sql(unload_path: str, src_db: str, src_schema: str, table: str, columns: list[str]) -> str:
-    col_list = ", ".join(f"{qident(c)}" for c in columns)
-
-    # IMPORTANT: If stage/path includes spaces/special chars, Snowflake requires quoting. [COPY INTO <location>]
-    unload_loc = stage_loc_literal(unload_path)
-
-    return f"""
-COPY INTO {unload_loc}
-FROM (SELECT {col_list} FROM {fq(src_db, src_schema, table)})
-FILE_FORMAT = (
-  TYPE = CSV
-  FIELD_DELIMITER = ','
-  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-  COMPRESSION = GZIP
+from config import (
+    DEFAULT_MIG_DB,
+    DEFAULT_MIG_SCHEMA,
+    DEFAULT_STAGE,
+    DEFAULT_INTEGRATION,
+    DEFAULT_NB_INT_STAGE,
+    DEFAULT_LOCAL_INT_STAGE,
 )
-OVERWRITE = TRUE;
-""".strip()
-
-
-def build_csv_load_sql(load_path: str, tgt_db: str, tgt_schema: str, table: str, columns: list[str]) -> str:
-    tgt_table = fq(tgt_db, tgt_schema, table)
-    tgt_col_list = ", ".join(qident(c) for c in columns)
-    sel_cols = ", ".join(f"${i}" for i in range(1, len(columns) + 1))
-
-    # IMPORTANT: If stage/path includes spaces/special chars, Snowflake requires quoting. [COPY INTO <table>]
-    from_loc = stage_loc_literal(load_path)
-
-    return f"""
-COPY INTO {tgt_table} ({tgt_col_list})
-FROM (SELECT {sel_cols} FROM {from_loc})
-FILE_FORMAT = (
-  TYPE = CSV
-  FIELD_DELIMITER = ','
-  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-  COMPRESSION = GZIP
+from connection import connect_sf, exec_sql
+from utils import (
+    qident,
+    fq,
+    bootstrap_db_schema,
+    build_azure_stage_url,
+    describe_storage_integration,
+    describe_stage,
+    ensure_storage_integration_azure,
+    ensure_external_stage_azure,
 )
-ON_ERROR = 'ABORT_STATEMENT';
-""".strip()
+from discovery import (
+    get_all_schemas,
+)
+from dependencies import (
+    validate_cross_db_dependencies,
+    build_table_dependency_order_from_views,
+)
+from migration.orchestrator import migrate_all_objects
 
 
-# ----------------------------
-# Semantic view migration
-# ----------------------------
-def list_semantic_views(conn, db: str, schema: str) -> list[str]:
-    cols, rows = exec_sql_with_cols(conn, f"SHOW SEMANTIC VIEWS IN SCHEMA {fq(db, schema)}")
-    i_name = _find_col(cols, "name")
-    if i_name is None:
-        return []
-    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
+def _update_phase_ui(phase_containers, log_container, phase, count, error):
+    """Update phase UI in real-time during migration."""
+    import streamlit as st
+
+    if phase in phase_containers:
+        if error:
+            phase_containers[phase].error(f"❌ **{phase}**: {error}")
+        else:
+            phase_containers[phase].success(f"✅ **{phase}** ({count} items)")
+    log_container.info(f"Completed: {phase}")
 
 
-def get_semantic_view_ddl(conn, db: str, schema: str, sv_name: str) -> Optional[str]:
-    return fetch_one_val(
-        conn,
-        "SELECT GET_DDL('SEMANTIC VIEW', %(n)s, TRUE)",
-        {"n": f"{db}.{schema}.{sv_name}"},
-    )
-
-
-def migrate_semantic_views(
-    src_conn, tgt_conn,
-    src_db: str, src_schema: str,
-    tgt_db: str, tgt_schema: str,
-    dry_run: bool, rewrite_db: bool
-):
-    svs = list_semantic_views(src_conn, src_db, src_schema)
-    for sv in svs:
-        ddl = get_semantic_view_ddl(src_conn, src_db, src_schema, sv)
-        if not ddl:
-            continue
-        if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
-        if not dry_run:
-            exec_script(tgt_conn, ddl, remove_comments=True)
-
-
-# ----------------------------
-# Cortex Agents migration (SQL)
-# ----------------------------
-def list_agents(conn, db: str, schema: str) -> list[str]:
-    cols, rows = exec_sql_with_cols(conn, f"SHOW AGENTS IN SCHEMA {fq(db, schema)}")
-    i_name = _find_col(cols, "name")
-    if i_name is None:
-        return []
-    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
-
-
-def describe_agent_row(conn, db: str, schema: str, agent: str) -> dict:
-    cols, rows = exec_sql_with_cols(conn, f"DESCRIBE AGENT {fq(db, schema, agent)}")
-    if not rows:
-        return {}
-    row = rows[0]
-    out = {}
-    for i, c in enumerate(cols):
-        if i < len(row):
-            out[c.lower()] = row[i]
-    return out
-
-
-def create_or_replace_agent_sql(
-    tgt_db: str, tgt_schema: str, agent_name: str,
-    comment: Optional[str], profile: Optional[str],
-    agent_spec: str
-) -> str:
-    lines = [f"CREATE OR REPLACE AGENT {fq(tgt_db, tgt_schema, agent_name)}"]
-    if comment:
-        lines.append(f"  COMMENT = '{_escape_sql_string(str(comment))}'")
-    if profile:
-        lines.append(f"  PROFILE = '{_escape_sql_string(str(profile))}'")
-    lines.append("FROM SPECIFICATION")
-    lines.append("$$")
-    lines.append(agent_spec or "")
-    lines.append("$$;")
-    return "\n".join(lines)
-
-
-def migrate_agents(
-    src_conn, tgt_conn,
-    src_db: str, src_schema: str,
-    tgt_db: str, tgt_schema: str,
-    dry_run: bool, rewrite_db: bool
-):
-    agents = list_agents(src_conn, src_db, src_schema)
-    for a in agents:
-        meta = describe_agent_row(src_conn, src_db, src_schema, a)
-        agent_spec = meta.get("agent_spec") or meta.get("specification") or ""
-        comment = meta.get("comment")
-        profile = meta.get("profile")
-
-        if rewrite_db and tgt_db != src_db and isinstance(agent_spec, str):
-            agent_spec = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, agent_spec)
-
-        sql = create_or_replace_agent_sql(tgt_db, tgt_schema, a, comment, profile, str(agent_spec))
-        if not dry_run:
-            exec_sql(tgt_conn, sql)
-
-
-# ----------------------------
-# Streamlit migration (SQL)
-# ----------------------------
-def list_streamlits(conn, db: str, schema: str) -> list[str]:
-    cols, rows = exec_sql_with_cols(conn, f"SHOW STREAMLITS IN SCHEMA {fq(db, schema)}")
-    i_name = _find_col(cols, "name")
-    if i_name is None:
-        return []
-    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
-
-
-def get_streamlit_ddl(conn, db: str, schema: str, app_name: str) -> Optional[str]:
-    return fetch_one_val(
-        conn,
-        "SELECT GET_DDL('STREAMLIT', %(n)s, TRUE)",
-        {"n": f"{db}.{schema}.{app_name}"},
-    )
-
-
-def migrate_streamlits(
-    src_conn, tgt_conn,
-    src_db: str, src_schema: str,
-    tgt_db: str, tgt_schema: str,
-    dry_run: bool, rewrite_db: bool,
-    initialize_live: bool = True
-):
-    apps = list_streamlits(src_conn, src_db, src_schema)
-    for app in apps:
-        ddl = get_streamlit_ddl(src_conn, src_db, src_schema, app)
-        if not ddl:
-            continue
-        if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
-
-        if not dry_run:
-            exec_script(tgt_conn, ddl, remove_comments=True)
-            if initialize_live:
-                exec_sql(tgt_conn, f"ALTER STREAMLIT {fq(tgt_db, tgt_schema, app)} ADD LIVE VERSION FROM LAST")
-
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="Snowflake Migrator (Azure Stage)", layout="wide")
-st.title("Snowflake → Snowflake Migrator (Azure stage + semantic views + agents + streamlits)")
+st.set_page_config(page_title="Snowflake Migrator", layout="wide")
+st.title("Snowflake → Snowflake Migrator")
 
 with st.sidebar:
     st.header("Source connection")
@@ -441,6 +55,11 @@ with st.sidebar:
     src_password = st.text_input("Source password", type="password")
     src_role = st.text_input("Source role", value="ACCOUNTADMIN")
     src_wh = st.text_input("Source warehouse", value="")
+    src_passcode = st.text_input(
+        "Source MFA TOTP passcode",
+        type="password",
+        help="Leave blank if MFA is not enabled",
+    )
 
     st.divider()
     st.header("Target connection")
@@ -449,6 +68,11 @@ with st.sidebar:
     tgt_password = st.text_input("Target password", type="password")
     tgt_role = st.text_input("Target role", value="ACCOUNTADMIN")
     tgt_wh = st.text_input("Target warehouse", value="")
+    tgt_passcode = st.text_input(
+        "Target MFA TOTP passcode",
+        type="password",
+        help="Leave blank if MFA is not enabled",
+    )
 
     st.divider()
     st.header("Utility namespace")
@@ -458,7 +82,9 @@ with st.sidebar:
 
     st.divider()
     st.header("Azure external stage")
-    integration_name = st.text_input("Storage integration name", value=DEFAULT_INTEGRATION)
+    integration_name = st.text_input(
+        "Storage integration name", value=DEFAULT_INTEGRATION
+    )
     azure_tenant_id = st.text_input("Azure tenant id (GUID)", value="")
     storage_account = st.text_input("Azure storage account name", value="")
     container = st.text_input("Azure container name", value="")
@@ -469,41 +95,187 @@ with st.sidebar:
     stage_prefix = st.text_input("Stage folder prefix for runs", value="sf_migration")
 
     st.divider()
-    connect_btn = st.button("Connect")
+    connect_both_btn = st.button("Connect Both")
+    col_csrc, col_ctgt = st.columns(2)
+    with col_csrc:
+        connect_src_btn = st.button("Connect Source Only")
+    with col_ctgt:
+        connect_tgt_btn = st.button("Connect Target Only")
 
 if "src_conn" not in st.session_state:
     st.session_state.src_conn = None
     st.session_state.tgt_conn = None
 
-if connect_btn:
+if connect_both_btn:
     try:
         st.session_state.src_conn = connect_sf(
-            src_account, src_user, src_password,
-            role=src_role, warehouse=src_wh or None
+            src_account,
+            src_user,
+            src_password,
+            role=src_role,
+            warehouse=src_wh or None,
+            passcode=src_passcode or None,
         )
         st.session_state.tgt_conn = connect_sf(
-            tgt_account, tgt_user, tgt_password,
-            role=tgt_role, warehouse=tgt_wh or None
+            tgt_account,
+            tgt_user,
+            tgt_password,
+            role=tgt_role,
+            warehouse=tgt_wh or None,
+            passcode=tgt_passcode or None,
         )
-        st.success("Connected.")
+        st.success("Both connected.")
     except Exception as e:
         st.session_state.src_conn = None
         st.session_state.tgt_conn = None
         st.error(f"Connection failed: {e}")
 
+if connect_src_btn:
+    try:
+        st.session_state.src_conn = connect_sf(
+            src_account,
+            src_user,
+            src_password,
+            role=src_role,
+            warehouse=src_wh or None,
+            passcode=src_passcode or None,
+        )
+        st.success("Source connected.")
+    except Exception as e:
+        st.session_state.src_conn = None
+        st.error(f"Source connection failed: {e}")
+
+if connect_tgt_btn:
+    try:
+        st.session_state.tgt_conn = connect_sf(
+            tgt_account,
+            tgt_user,
+            tgt_password,
+            role=tgt_role,
+            warehouse=tgt_wh or None,
+            passcode=tgt_passcode or None,
+        )
+        st.success("Target connected.")
+    except Exception as e:
+        st.session_state.tgt_conn = None
+        st.error(f"Target connection failed: {e}")
+
 src_conn = st.session_state.src_conn
 tgt_conn = st.session_state.tgt_conn
-if not (src_conn and tgt_conn):
-    st.stop()
+
+_src_status = "✅ Source connected" if src_conn else "❌ Source not connected"
+_tgt_status = "✅ Target connected" if tgt_conn else "❌ Target not connected"
+st.caption(f"{_src_status}  |  {_tgt_status}")
 
 stage_url = build_azure_stage_url(storage_account, container, prefix)
+
+st.divider()
+
+st.header("Local Backup & Restore")
+
+local_bk_tab, local_rs_tab = st.tabs(["Backup to Local", "Restore from Local"])
+
+with local_bk_tab:
+    st.markdown("Export schemas from **source** Snowflake to a local directory.")
+    if not src_conn:
+        st.warning("Connect to the **source** account first (sidebar).")
+    else:
+        bk_dir = st.text_input(
+            "Local backup directory",
+            value=os.path.join(tempfile.gettempdir(), "sf_backup"),
+        )
+        bk_int_stage = st.text_input(
+            "Internal stage (created on source)",
+            value=DEFAULT_LOCAL_INT_STAGE,
+            key="bk_stage",
+        )
+        bk_auto_id = st.checkbox(
+            "Auto-generate new run id each backup", value=True, key="bk_auto_id"
+        )
+        bk_run_id = st.text_input(
+            "Backup run id", value=str(uuid.uuid4())[:8], key="bk_run_id"
+        )
+
+        bk_db_rows = exec_sql(src_conn, "SHOW DATABASES")
+        bk_db_names = [r[1] for r in bk_db_rows if len(r) > 1]
+        bk_src_db = st.selectbox("Source database", bk_db_names, key="bk_src_db")
+
+        bk_schema_rows = exec_sql(
+            src_conn, f"SHOW SCHEMAS IN DATABASE {qident(bk_src_db)}"
+        )
+        bk_schema_names = [r[1] for r in bk_schema_rows if len(r) > 1]
+        bk_schema_names = [
+            s for s in bk_schema_names if s and s.upper() != "INFORMATION_SCHEMA"
+        ]
+        bk_all_schemas = st.multiselect(
+            "Schemas to back up",
+            bk_schema_names,
+            default=[s for s in bk_schema_names if s.upper() == "PUBLIC"] or [],
+            key="bk_schemas",
+        )
+
+        bk_c1, bk_c2, bk_c3, bk_c4, bk_c5, bk_c6, bk_c7, bk_c8 = st.columns(8)
+        with bk_c1:
+            bk_ddl = st.checkbox("Schema DDL", value=True, key="bk_ddl")
+        with bk_c2:
+            bk_views = st.checkbox("Views", value=True, key="bk_views")
+        with bk_c3:
+            bk_sv = st.checkbox("Semantic views", value=True, key="bk_sv")
+        with bk_c4:
+            bk_ag = st.checkbox("Agents", value=True, key="bk_ag")
+        with bk_c5:
+            bk_sl = st.checkbox("Streamlits", value=True, key="bk_sl")
+        with bk_c6:
+            bk_nb = st.checkbox("Notebooks", value=True, key="bk_nb")
+        with bk_c7:
+            bk_data = st.checkbox("Table data", value=True, key="bk_data")
+        with bk_c8:
+            bk_stg = st.checkbox("Stage files", value=True, key="bk_stg")
+        bk_dry = st.checkbox("Dry run", value=False, key="bk_dry")
+
+        if st.button("Run Backup Now"):
+            if not bk_all_schemas:
+                st.error("Select at least one schema.")
+            else:
+                st.info(f"Backup run id: **{bk_run_id}**")
+                st.warning("Local backup UI not yet migrated to new modules.")
+
+with local_rs_tab:
+    st.markdown("Import schemas from a local backup into **target** Snowflake.")
+    if not tgt_conn:
+        st.warning("Connect to the **target** account first (sidebar).")
+    else:
+        rs_path = st.text_input(
+            "Backup path",
+            value="",
+            help="e.g. C:/Users/.../sf_backup/<run_id>/<DATABASE>",
+        )
+        rs_tgt_db = st.text_input("Target database name", value="", key="rs_tgt_db")
+        rs_int_stage = st.text_input(
+            "Internal stage (created on target)",
+            value=DEFAULT_LOCAL_INT_STAGE,
+            key="rs_stage",
+        )
+
+        rs_dry = st.checkbox("Dry run", value=False, key="rs_dry")
+
+        if st.button("Run Restore Now"):
+            if not rs_path.strip():
+                st.error("Please enter the backup path.")
+            elif not rs_tgt_db.strip():
+                st.error("Please enter the target database name.")
+            else:
+                st.warning("Local restore UI not yet migrated to new modules.")
+
+st.divider()
+
+if not (src_conn and tgt_conn):
+    st.info("Connect **both** source and target accounts to use Azure migration.")
+    st.stop()
+
 st.subheader("Computed Azure stage URL")
 st.code(stage_url)
 
-
-# ----------------------------
-# Setup (always latest)
-# ----------------------------
 st.header("Setup (always latest)")
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -520,9 +292,13 @@ with c1:
 with c2:
     if st.button("Ensure Integration (both)"):
         try:
-            ensure_storage_integration_azure(src_conn, integration_name, azure_tenant_id, [stage_url])
-            ensure_storage_integration_azure(tgt_conn, integration_name, azure_tenant_id, [stage_url])
-            st.success("Integration ensured (created/altered) in both.")
+            ensure_storage_integration_azure(
+                src_conn, integration_name, azure_tenant_id, [stage_url]
+            )
+            ensure_storage_integration_azure(
+                tgt_conn, integration_name, azure_tenant_id, [stage_url]
+            )
+            st.success("Integration ensured in both.")
         except Exception as e:
             st.error(e)
 
@@ -543,10 +319,18 @@ with c3:
 with c4:
     if st.button("Ensure Stage (both)"):
         try:
-            ensure_storage_integration_azure(src_conn, integration_name, azure_tenant_id, [stage_url])
-            ensure_storage_integration_azure(tgt_conn, integration_name, azure_tenant_id, [stage_url])
-            ensure_external_stage_azure(src_conn, mig_db, mig_schema, stage_name, stage_url, integration_name)
-            ensure_external_stage_azure(tgt_conn, mig_db, mig_schema, stage_name, stage_url, integration_name)
+            ensure_storage_integration_azure(
+                src_conn, integration_name, azure_tenant_id, [stage_url]
+            )
+            ensure_storage_integration_azure(
+                tgt_conn, integration_name, azure_tenant_id, [stage_url]
+            )
+            ensure_external_stage_azure(
+                src_conn, mig_db, mig_schema, stage_name, stage_url, integration_name
+            )
+            ensure_external_stage_azure(
+                tgt_conn, mig_db, mig_schema, stage_name, stage_url, integration_name
+            )
             st.success("Stage ensured in both.")
         except Exception as e:
             st.error(e)
@@ -556,17 +340,27 @@ with c5:
         try:
             s = describe_stage(src_conn, mig_db, mig_schema, stage_name)
             t = describe_stage(tgt_conn, mig_db, mig_schema, stage_name)
-            st.subheader("Source stage")
-            st.write({"URL": s.get("URL"), "STORAGE_INTEGRATION": s.get("STORAGE_INTEGRATION")})
-            st.subheader("Target stage")
-            st.write({"URL": t.get("URL"), "STORAGE_INTEGRATION": t.get("STORAGE_INTEGRATION")})
+            st.write(
+                {
+                    "URL": s.get("URL"),
+                    "STORAGE_INTEGRATION": s.get("STORAGE_INTEGRATION"),
+                }
+            )
+            st.write(
+                {
+                    "URL": t.get("URL"),
+                    "STORAGE_INTEGRATION": t.get("STORAGE_INTEGRATION"),
+                }
+            )
         except Exception as e:
             st.error(e)
 
 if st.button("Test LIST @stage (both)"):
     try:
-        src_list = list_stage(src_conn, mig_db, mig_schema, stage_name)
-        tgt_list = list_stage(tgt_conn, mig_db, mig_schema, stage_name)
+        exec_sql(src_conn, f"USE {mig_db}.{mig_schema}")
+        exec_sql(tgt_conn, f"USE {mig_db}.{mig_schema}")
+        src_list = exec_sql(src_conn, f"LIST @{stage_name}")
+        tgt_list = exec_sql(tgt_conn, f"LIST @{stage_name}")
         st.subheader("Source LIST (first 50)")
         st.write(src_list[:50])
         st.subheader("Target LIST (first 50)")
@@ -577,151 +371,312 @@ if st.button("Test LIST @stage (both)"):
 
 st.divider()
 
+st.header("Comprehensive Migration (All Objects)")
 
-# ----------------------------
-# Migration
-# ----------------------------
-st.header("Migration (DDL + semantic views + agents + streamlits + CSV data copy)")
+if not (src_conn and tgt_conn):
+    st.warning("Connect both source and target accounts to use migration.")
+    st.stop()
 
 db_rows = exec_sql(src_conn, "SHOW DATABASES")
 db_names = [r[1] for r in db_rows if len(r) > 1]
-src_db = st.selectbox("Source database", db_names)
+# Source DB selector
+src_db = st.selectbox("Source database", db_names, key="mig_src_db")
 
-schema_rows = exec_sql(src_conn, f"SHOW SCHEMAS IN DATABASE {qident(src_db)}")
-schema_names = [r[1] for r in schema_rows if len(r) > 1]
-schema_names = [s for s in schema_names if s and s.upper() not in SKIP_SCHEMAS]
-selected_schemas = st.multiselect(
-    "Schemas to migrate",
-    schema_names,
-    default=[s for s in schema_names if s.upper() == "PUBLIC"] or [],
+# Keep target DB in sync with source selection: when the user selects a
+# source database, update the target database text field to the same name.
+# This makes it convenient to migrate into a same-named target DB by
+# default while still allowing manual edits afterwards.
+if "mig_tgt_db" not in st.session_state or st.session_state.get("mig_tgt_db") != src_db:
+    st.session_state["mig_tgt_db"] = src_db
+
+tgt_db = st.text_input(
+    "Target database name",
+    value=st.session_state.get("mig_tgt_db", src_db),
+    key="mig_tgt_db",
 )
 
-tgt_db = st.text_input("Target database name", value=src_db)
+run_id = st.text_input("Run id", value=str(uuid.uuid4())[:8], key="mig_run_id")
 
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-with col1:
-    migrate_ddl = st.checkbox("Migrate schema DDL", value=True)
-with col2:
-    migrate_semantic = st.checkbox("Migrate semantic views", value=True)
-with col3:
-    migrate_agents_flag = st.checkbox("Migrate Cortex Agents", value=True)
-with col4:
-    migrate_streamlits_flag = st.checkbox("Migrate Streamlit apps", value=True)
-with col5:
-    copy_data = st.checkbox("Copy data (CSV+GZIP)", value=True)
-with col6:
-    dry_run = st.checkbox("Dry run", value=False)
+dry_run = st.checkbox(
+    "Dry run (validate without executing)", value=False, key="mig_dry_run"
+)
 
-rewrite_db = st.checkbox("Rewrite DB name inside DDL/specs when target DB differs", value=True)
-init_streamlit_live = st.checkbox("Initialize Streamlit LIVE version", value=True)
-run_id = st.text_input("Run id", value=str(uuid.uuid4())[:8])
+st.divider()
 
-if st.button("Run migration now"):
-    # Precheck infra (integration + stage)
+st.subheader("Pre-Migration Analysis")
+
+all_schemas = get_all_schemas(src_conn, src_db)
+
+if not all_schemas:
+    st.warning(f"No schemas found in database {src_db}")
+    st.stop()
+
+st.info(f"Found {len(all_schemas)} schemas in {src_db}")
+
+if "analysis_cache" not in st.session_state:
+    st.session_state.analysis_cache = {}
+
+if "analysis_db" not in st.session_state:
+    st.session_state.analysis_db = None
+
+refresh_btn = st.button("🔄 Refresh Analysis", type="secondary")
+
+cache_key = f"{src_db}"
+
+# Quick validation - only check cross-db dependencies
+if "validation_done" not in st.session_state:
+    st.session_state.validation_done = False
+    st.session_state.validation_result = None
+
+if refresh_btn:
+    with st.spinner("Validating..."):
+        try:
+            validation = validate_cross_db_dependencies(src_conn, src_db, all_schemas)
+            st.session_state.validation_result = validation
+            st.session_state.validation_done = True
+        except Exception as e:
+            st.session_state.validation_result = None
+            st.session_state.validation_done = False
+
+# Show validation status
+validation = st.session_state.get("validation_result")
+if validation:
+    if not validation["valid"]:
+        st.error("❌ Migration BLOCKED: Cross-database dependencies detected!")
+        for err in validation["errors"]:
+            st.write(f"- {err}")
+        st.stop()
+    if validation.get("warnings"):
+        st.warning("⚠️ Warnings:")
+        for warn in validation["warnings"]:
+            st.write(f"- {warn}")
+else:
+    st.info("Click 'Refresh Analysis' to validate schemas")
+
+# Compute and show schema order (fast - just reads metadata)
+ordered_schemas = build_table_dependency_order_from_views(src_conn, src_db, all_schemas)
+with st.expander("Schema Migration Order", expanded=True):
+    st.markdown("**Phases will run in this order:**")
+    for i, sch in enumerate(ordered_schemas, 1):
+        st.write(f"{i}. `{sch}`")
+
+    with st.expander("Migration Execution Order", expanded=False):
+        st.markdown("""
+        **Objects will be migrated in this order:**
+        1. SEQUENCES
+        2. FILE FORMATS
+        3. TAGS
+        4. TABLES (DDL, skip Iceberg)
+        5. MATERIALIZED VIEWS
+        6. VIEWS (with dependency resolution)
+        7. SEMANTIC VIEWS
+        8. STREAMS
+        9. FUNCTIONS (skip external handlers)
+        10. PROCEDURES
+        11. POLICIES (masking, row access)
+        12. TASKS
+        13. DYNAMIC TABLES
+        14. PIPES
+        15. ALERTS
+        16. TABLE DATA
+        17. STREAMLITS
+        18. AGENTS
+        
+        **Note:** Migration stops on critical errors, but collects warnings.
+        """)
+
+st.divider()
+
+# Phase selection
+st.subheader("⚙️ Phase Selection")
+all_phases = [
+    "CREATE_SCHEMAS",
+    "SEQUENCES",
+    "FILE_FORMATS",
+    "TAGS",
+    "TABLE_DDLS",
+    "TABLE_DATA",
+    "DYNAMIC_TABLES",  # Before VIEWS - views may reference DTs
+    "VIEWS",
+    "FUNCTIONS",
+    "PROCEDURES",
+    "STREAMS",
+    "POLICIES",
+    "TASKS",
+    "PIPES",
+    "ALERTS",
+    "MATERIALIZED_VIEWS",
+    "SEMANTIC_VIEWS",
+    "STREAMLITS",
+    "AGENTS",
+]
+selected_phases = st.multiselect(
+    "Select phases to run",
+    all_phases,
+    default=["VIEWS", "MATERIALIZED_VIEWS", "SEMANTIC_VIEWS"],
+    key="selected_phases",
+)
+
+st.divider()
+
+confirm_migrate = st.checkbox(
+    "I confirm this will migrate ALL objects from source to target. This may overwrite existing objects.",
+    key="confirm_migrate_all",
+)
+
+migrate_btn = st.button(
+    "MIGRATE EVERYTHING", type="primary", disabled=not confirm_migrate
+)
+
+if migrate_btn and confirm_migrate:
+    st.divider()
+    st.subheader("Migration Execution")
+
     try:
-        ensure_storage_integration_azure(src_conn, integration_name, azure_tenant_id, [stage_url])
-        ensure_storage_integration_azure(tgt_conn, integration_name, azure_tenant_id, [stage_url])
-        ensure_external_stage_azure(src_conn, mig_db, mig_schema, stage_name, stage_url, integration_name)
-        ensure_external_stage_azure(tgt_conn, mig_db, mig_schema, stage_name, stage_url, integration_name)
+        ensure_storage_integration_azure(
+            src_conn, integration_name, azure_tenant_id, [stage_url]
+        )
+        ensure_storage_integration_azure(
+            tgt_conn, integration_name, azure_tenant_id, [stage_url]
+        )
+        ensure_external_stage_azure(
+            src_conn, mig_db, mig_schema, stage_name, stage_url, integration_name
+        )
+        ensure_external_stage_azure(
+            tgt_conn, mig_db, mig_schema, stage_name, stage_url, integration_name
+        )
     except Exception as e:
-        st.error(f"Pre-check failed (integration/stage): {e}")
+        st.error(f"Pre-check failed: {e}")
         st.stop()
 
-    if migrate_ddl and not dry_run:
+    if not dry_run:
         exec_sql(tgt_conn, f"CREATE DATABASE IF NOT EXISTS {qident(tgt_db)}")
+        bootstrap_db_schema(tgt_conn, mig_db, mig_schema)
 
     stage_ref = f"@{mig_db}.{mig_schema}.{stage_name}"
 
-    for sch in selected_schemas:
-        st.subheader(f"{src_db}.{sch}")
-        tgt_schema = sch
+    # Initialize session state for logs
+    if "migration_logs" not in st.session_state:
+        st.session_state.migration_logs = []
+    if "migration_result" not in st.session_state:
+        st.session_state.migration_result = None
 
-        # --- Schema DDL (strip Streamlit statements so schema deploy doesn't crash)
-        ddl = fetch_one_val(
+    st.divider()
+    st.subheader("🚀 Migration Progress")
+
+    # Use selected schemas from the UI
+    migration_schemas = st.session_state.get("all_schemas", all_schemas)
+    total_schemas = len(migration_schemas)
+
+    # Create columns for status
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Schemas", total_schemas)
+    with col2:
+        st.metric("Source DB", src_db)
+    with col3:
+        st.metric("Target DB", tgt_db)
+
+    st.divider()
+    st.subheader("🚀 Live Migration Progress")
+
+    # Phase containers for live updates
+    phase_containers = {}
+    for phase in [
+        "CREATE_SCHEMAS",
+        "SEQUENCES",
+        "FILE_FORMATS",
+        "TAGS",
+        "TABLE_DDLS",
+        "TABLE_DATA",
+        "VIEWS",
+        "FUNCTIONS",
+        "PROCEDURES",
+        "STREAMS",
+        "POLICIES",
+        "TASKS",
+        "DYNAMIC_TABLES",
+        "PIPES",
+        "ALERTS",
+        "MATERIALIZED_VIEWS",
+        "SEMANTIC_VIEWS",
+        "STREAMLITS",
+        "AGENTS",
+    ]:
+        phase_containers[phase] = st.empty()
+
+    log_container = st.empty()
+    log_container.info("Starting migration...")
+
+    try:
+        result = migrate_all_objects(
             src_conn,
-            "SELECT GET_DDL('SCHEMA', %(n)s, TRUE)",
-            {"n": f"{src_db}.{sch}"},
+            tgt_conn,
+            src_db,
+            tgt_db,
+            migration_schemas,
+            stage_ref,
+            run_id,
+            dry_run=dry_run,
+            init_streamlit_live=True,
+            tgt_query_wh=tgt_wh or None,
+            nb_int_stage_name=DEFAULT_NB_INT_STAGE,
+            stage_prefix=stage_prefix,
+            phase_callback=lambda phase, count, error: _update_phase_ui(
+                phase_containers, log_container, phase, count, error
+            ),
+            selected_phases=selected_phases,
         )
-        if not ddl:
-            st.warning("No schema DDL returned; skipping schema.")
-            continue
 
-        if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+        # Final log update
+        logs = result.get("logs", [])
+        log_text = "✅ **Migration Complete!**\n\n"
+        for log_msg in logs[-10:]:  # Show last 10 logs
+            log_text += f"• {log_msg}\n"
+        log_container.markdown(log_text)
 
-        st.text_area("Schema DDL preview", ddl, height=200)
+        # Show logs
+        logs = result.get("logs", [])
+        if logs:
+            with st.expander("📋 Migration Logs", expanded=False):
+                for log_msg in logs:
+                    st.write(f"• {log_msg}")
 
-        if migrate_ddl and not dry_run:
-            ddl_clean = strip_streamlit_from_schema_ddl(ddl)
-            exec_script(tgt_conn, ddl_clean, remove_comments=True)
+        # Show warnings
+        warnings = result.get("warnings", [])
+        if warnings:
+            st.divider()
+            with st.expander("⚠️ Warnings", expanded=True):
+                for w in warnings[:20]:  # Limit display
+                    st.write(f"- {w}")
+                if len(warnings) > 20:
+                    st.write(f"... and {len(warnings) - 20} more warnings")
 
-        # --- Semantic views
-        if migrate_semantic:
-            try:
-                migrate_semantic_views(
-                    src_conn, tgt_conn,
-                    src_db, sch,
-                    tgt_db, tgt_schema,
-                    dry_run=dry_run,
-                    rewrite_db=rewrite_db,
-                )
-                st.success("Semantic views migrated.")
-            except Exception as e:
-                st.error(f"Semantic view migration failed: {e}")
+        # Show skipped
+        skipped = result.get("skipped", [])
+        if skipped:
+            st.divider()
+            with st.expander("⏭️ Skipped Objects", expanded=False):
+                for s in skipped[:20]:
+                    st.write(f"- {s}")
+                if len(skipped) > 20:
+                    st.write(f"... and {len(skipped) - 20} more")
 
-        # --- Cortex Agents
-        if migrate_agents_flag:
-            try:
-                migrate_agents(
-                    src_conn, tgt_conn,
-                    src_db, sch,
-                    tgt_db, tgt_schema,
-                    dry_run=dry_run,
-                    rewrite_db=rewrite_db,
-                )
-                st.success("Cortex Agents migrated.")
-            except Exception as e:
-                st.error(f"Agent migration failed: {e}")
+        # Show errors
+        errors = result.get("errors", [])
+        if errors:
+            st.divider()
+            st.error("❌ Migration Errors")
+            for e in errors:
+                st.write(f"- {e}")
+            st.stop()
 
-        # --- Streamlit apps
-        if migrate_streamlits_flag:
-            try:
-                migrate_streamlits(
-                    src_conn, tgt_conn,
-                    src_db, sch,
-                    tgt_db, tgt_schema,
-                    dry_run=dry_run,
-                    rewrite_db=rewrite_db,
-                    initialize_live=init_streamlit_live,
-                )
-                st.success("Streamlit apps migrated.")
-            except Exception as e:
-                st.error(f"Streamlit migration failed: {e}")
+        # Success!
+        st.balloons()
+        st.success(
+            f"🎉 MIGRATION COMPLETE! Total objects: {result.get('total_migrated', 0)}"
+        )
 
-        # --- Data copy
-        if copy_data:
-            tables = exec_sql(src_conn, f"SHOW TABLES IN SCHEMA {fq(src_db, sch)}")
-            table_names = [r[1] for r in tables if len(r) > 1]
-
-            for t in table_names:
-                cols = get_table_columns(src_conn, src_db, sch, t)
-                if not cols:
-                    continue
-
-                # NOTE: keep original table name in folder; quoting in COPY handles spaces.
-                path = f"{stage_prefix}/{run_id}/{src_db}/{sch}/{t}/"
-                unload_path = f"{stage_ref}/{path}"
-                load_path = f"{stage_ref}/{path}"
-
-                unload_sql = build_csv_unload_sql(unload_path, src_db, sch, t, cols)
-                load_sql = build_csv_load_sql(load_path, tgt_db, sch, t, cols)
-
-                with st.expander(f"Copy {sch}.{t}", expanded=False):
-                    st.code(unload_sql, language="sql")
-                    st.code(load_sql, language="sql")
-
-                if not dry_run:
-                    exec_sql(src_conn, unload_sql)
-                    exec_sql(tgt_conn, load_sql)
-
-    st.success("Done (check errors above if any).")
+    except Exception as e:
+        log_container.error(f"Migration failed: {str(e)}")
+        st.error(f"MIGRATION FAILED: {str(e)}")

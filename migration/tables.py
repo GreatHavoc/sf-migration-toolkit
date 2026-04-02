@@ -1,7 +1,7 @@
 import re
 from connection import exec_sql, fetch_one_val
 from discovery import get_table_columns, is_iceberg_table
-from utils import fq, stage_loc_literal, sql_string_literal, qident
+from utils import fq, stage_loc_literal, sql_string_literal, qident, rewrite_db_in_ddl
 
 
 # --- FK discovery + ordering (copied from mainv2 to restore default FK-aware ordering) ---
@@ -167,7 +167,7 @@ def migrate_table_ddls(
             continue
 
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
 
         if not dry_run:
             try:
@@ -216,11 +216,22 @@ def migrate_table_data_ordered(
 
     errors = []
     migrated = 0
+    validation_results = []
 
     for t in ordered_tables:
         cols = get_table_columns(src_conn, src_db, schema, t)
         if not cols:
             continue
+
+        # Get source row count before migration
+        src_count = None
+        try:
+            src_count = exec_sql(
+                src_conn, f"SELECT COUNT(*) FROM {fq(src_db, schema, t)}"
+            )
+            src_count = src_count[0][0] if src_count else None
+        except Exception:
+            pass
 
         path = f"data/{run_id}/{src_db}/{schema}/{t}/"
         unload_path = f"{stage_ref}/{path}"
@@ -234,13 +245,47 @@ def migrate_table_data_ordered(
                 exec_sql(src_conn, unload_sql)
                 exec_sql(tgt_conn, load_sql)
                 exec_sql(src_conn, f"REMOVE {sql_string_literal(unload_path)}")
+
+                # Validate row count on target
+                tgt_count = None
+                try:
+                    tgt_count = exec_sql(
+                        tgt_conn, f"SELECT COUNT(*) FROM {fq(tgt_db, tgt_schema, t)}"
+                    )
+                    tgt_count = tgt_count[0][0] if tgt_count else None
+                except Exception:
+                    pass
+
+                if (
+                    src_count is not None
+                    and tgt_count is not None
+                    and src_count != tgt_count
+                ):
+                    validation_results.append(
+                        {
+                            "table": t,
+                            "src_count": src_count,
+                            "tgt_count": tgt_count,
+                            "status": "MISMATCH",
+                        }
+                    )
+                elif src_count is not None and tgt_count is not None:
+                    validation_results.append(
+                        {
+                            "table": t,
+                            "src_count": src_count,
+                            "tgt_count": tgt_count,
+                            "status": "OK",
+                        }
+                    )
+
                 migrated += 1
             except Exception as e:
                 errors.append(f"{t}: {str(e)}")
         else:
             migrated += 1
 
-    return {"migrated": migrated, "errors": errors}
+    return {"migrated": migrated, "errors": errors, "validation": validation_results}
 
 
 def build_csv_unload_sql(

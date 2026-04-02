@@ -1,2 +1,4 @@
 # Ignore backup folder
 sf_backup/
+__pycache__/
+*.pyc

@@ -12,6 +12,7 @@ from discovery import (
     list_pipes,
     get_pipe_ddl,
 )
+from utils import rewrite_db_in_ddl
 
 
 def migrate_streams(
@@ -37,7 +38,7 @@ def migrate_streams(
             errors.append(f"{stream}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -124,7 +125,7 @@ def migrate_tasks(
             errors.append(f"{task}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -160,7 +161,7 @@ def migrate_alerts(
             errors.append(f"{alert}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -254,7 +255,7 @@ def migrate_dynamic_tables(
             errors.append(f"{dt}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -290,7 +291,7 @@ def migrate_pipes(
             errors.append(f"{pipe}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)

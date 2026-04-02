@@ -39,6 +39,7 @@ def inventory_all_objects(conn, db: str, schema: str) -> dict:
         "dynamic_tables": [],
         "external_tables": [],
         "alerts": [],
+        "cortex_search_services": [],
     }
 
     try:
@@ -140,6 +141,12 @@ def inventory_all_objects(conn, db: str, schema: str) -> dict:
     try:
         ext = exec_sql(conn, f"SHOW EXTERNAL TABLES IN SCHEMA {fq(db, schema)}")
         inventory["external_tables"] = [r[1] for r in ext if len(r) > 1]
+    except:
+        pass
+
+    try:
+        css = exec_sql(conn, f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {fq(db, schema)}")
+        inventory["cortex_search_services"] = [r[1] for r in css if len(r) > 1]
     except:
         pass
 
@@ -655,3 +662,97 @@ def get_stage_ddl(conn, db: str, schema: str, stage_name: str) -> Optional[str]:
         )
     except Exception:
         return None
+
+
+def list_cortex_search_services(conn, db: str, schema: str) -> list[str]:
+    """List Cortex Search services in a schema."""
+    cols, rows = exec_sql_with_cols(
+        conn, f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {fq(db, schema)}"
+    )
+    i_name = _find_col(cols, "name")
+    if i_name is None:
+        return []
+    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
+
+
+def get_cortex_search_service_info(
+    conn, db: str, schema: str, name: str
+) -> Optional[dict]:
+    """Get metadata for a Cortex Search service from SHOW output.
+
+    Returns a dict with keys matching SHOW CORTEX SEARCH SERVICES columns,
+    or None if not found.
+    """
+    try:
+        cols, rows = exec_sql_with_cols(
+            conn,
+            f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {fq(db, schema)}",
+        )
+    except Exception:
+        return None
+
+    col_map = {c.lower(): i for i, c in enumerate(cols)}
+    target = name.upper()
+
+    for r in rows:
+        i_name = col_map.get("name")
+        if i_name is None or len(r) <= i_name:
+            continue
+        if str(r[i_name]).upper() == target:
+            info = {}
+            for col_name, idx in col_map.items():
+                if idx < len(r):
+                    info[col_name] = r[idx]
+            return info
+    return None
+
+
+def build_cortex_search_ddl(info: dict, db: str, schema: str) -> Optional[str]:
+    """Reconstruct CREATE CORTEX SEARCH SERVICE DDL from SHOW metadata.
+
+    GET_DDL does not support CORTEX_SEARCH_SERVICE, so we rebuild the
+    CREATE statement from SHOW output columns.
+    """
+    if not info:
+        return None
+
+    name = info.get("name")
+    if not name:
+        return None
+
+    search_col = info.get("search_column", "")
+    attr_cols = info.get("attribute_columns", "")
+    columns = info.get("columns", "")
+    pk_cols = info.get("primary_key_columns", "")
+    warehouse = info.get("warehouse", "")
+    target_lag = info.get("target_lag", "")
+    comment = info.get("comment", "")
+    definition = info.get("definition", "")
+
+    if not definition:
+        return None
+
+    parts = [f"CREATE OR REPLACE CORTEX SEARCH SERVICE {fq(db, schema, name)}"]
+
+    if search_col:
+        parts.append(f"  ON {search_col}")
+
+    if attr_cols:
+        parts.append(f"  ATTRIBUTES {attr_cols}")
+
+    if pk_cols:
+        parts.append(f"  PRIMARY KEY ({pk_cols})")
+
+    if warehouse:
+        parts.append(f"  WAREHOUSE = {warehouse}")
+
+    if target_lag:
+        parts.append(f"  TARGET_LAG = '{target_lag}'")
+
+    if comment:
+        escaped = comment.replace("'", "''")
+        parts.append(f"  COMMENT = '{escaped}'")
+
+    parts.append(f"AS {definition}")
+
+    return "\n".join(parts)

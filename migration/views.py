@@ -8,6 +8,7 @@ from discovery import (
     list_materialized_views,
     get_materialized_view_ddl,
 )
+from utils import rewrite_db_in_ddl
 from dependencies import _extract_fqns_from_sql
 
 
@@ -66,22 +67,25 @@ def resolve_view_order(
             if name in name_set and name != v:
                 deps[v].add(name)
 
-    indeg = {v: 0 for v in view_names}
+    # Build reverse lookup: for each view, which views depend on it?
+    dependents = {v: set() for v in view_names}
     for v, ds in deps.items():
         for d in ds:
-            indeg[d] += 1
+            dependents[d].add(v)
+
+    # indeg = number of prerequisites each view has
+    indeg = {v: len(deps[v]) for v in view_names}
 
     q = [v for v, d in indeg.items() if d == 0]
     order = []
     while q:
         n = q.pop(0)
         order.append(n)
-        for m in view_names:
-            if n in deps.get(m, set()):
-                indeg[m] -= 1
-                deps[m].discard(n)
-                if indeg[m] == 0:
-                    q.append(m)
+        # Satisfy dependents
+        for m in dependents[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                q.append(m)
 
     if len(order) != len(view_names):
         return view_names
@@ -107,7 +111,7 @@ def migrate_views(
     for v in views:
         ddl = get_view_ddl(src_conn, src_db, src_schema, v) or ""
         if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         ddls[v] = ddl
 
     order = resolve_view_order(views, ddls, src_db, src_schema)
@@ -265,7 +269,7 @@ def migrate_semantic_views(
             errors.append(f"{sv}: Could not get DDL")
             continue
         if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_script(tgt_conn, ddl, remove_comments=True)
@@ -301,7 +305,7 @@ def migrate_materialized_views(
             errors.append(f"{mv}: Could not get DDL")
             continue
         if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)

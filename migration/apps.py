@@ -11,6 +11,7 @@ from discovery import (
     describe_agent_row,
     get_all_schemas,
 )
+from utils import rewrite_db_in_ddl
 
 
 def _escape_sql_string(v: str) -> str:
@@ -39,7 +40,7 @@ def migrate_streamlits(
             errors.append(f"{app}: Could not get DDL")
             continue
         if rewrite_db and tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
 
         if not dry_run:
             try:
@@ -100,7 +101,7 @@ def migrate_agents(
         profile = meta.get("profile")
 
         if rewrite_db and tgt_db != src_db and isinstance(agent_spec, str):
-            agent_spec = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, agent_spec)
+            agent_spec = rewrite_db_in_ddl(agent_spec, src_db, tgt_db)
 
         sql = create_or_replace_agent_sql(
             tgt_db, tgt_schema, a, comment, profile, str(agent_spec)
@@ -142,7 +143,7 @@ def migrate_sequences(
             errors.append(f"{seq}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -180,7 +181,7 @@ def migrate_file_formats(
             errors.append(f"{ff}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)

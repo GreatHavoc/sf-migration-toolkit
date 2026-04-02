@@ -370,21 +370,25 @@ def build_global_view_dependency_order(conn, db: str, schemas: list) -> dict:
             if ref_fqn in nodes:
                 edges[fqn].add(ref_fqn)
 
-    for n, ds in edges.items():
-        for d in ds:
-            indeg[d] += 1
+    # Build reverse lookup: for each node, which nodes depend on it?
+    dependents = {n: set() for n in nodes}
+    for fqn, prereqs in edges.items():
+        for prereq in prereqs:
+            dependents[prereq].add(fqn)
+
+    # indeg = number of prerequisites each node has
+    indeg = {n: len(edges[n]) for n in nodes}
 
     q = [n for n, d in indeg.items() if d == 0]
     order = []
     while q:
         n = q.pop(0)
         order.append(n)
-        for m in list(nodes):
-            if n in edges.get(m, set()):
-                indeg[m] -= 1
-                edges[m].discard(n)
-                if indeg[m] == 0:
-                    q.append(m)
+        # Satisfy dependents
+        for m in dependents[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                q.append(m)
 
     cycles = []
     if len(order) != len(nodes):
@@ -466,7 +470,6 @@ def build_table_dependency_order_from_views(conn, db: str, schemas: list) -> lis
                     )
 
     deps = {s: set() for s in schemas}
-    indeg = {s: 0 for s in schemas}
 
     for sch in schemas:
         referenced_schemas = set()
@@ -478,20 +481,25 @@ def build_table_dependency_order_from_views(conn, db: str, schemas: list) -> lis
                             referenced_schemas.add(r_sch)
         deps[sch] = referenced_schemas
 
+    # Build reverse lookup: for each schema, which schemas depend on it?
+    dependents = {s: set() for s in schemas}
     for s, rs in deps.items():
         for r in rs:
-            indeg[r] = indeg.get(r, 0) + 1
+            dependents[r].add(s)
+
+    # indeg = number of prerequisite schemas each schema depends on
+    indeg = {s: len(deps[s]) for s in schemas}
 
     q = [s for s, d in indeg.items() if d == 0]
     order = []
     while q:
         n = q.pop(0)
         order.append(n)
-        for m in list(deps.keys()):
-            if n in deps.get(m, set()):
-                indeg[m] -= 1
-                if indeg[m] == 0:
-                    q.append(m)
+        # Satisfy dependents
+        for m in dependents[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                q.append(m)
 
     if len(order) != len(schemas):
         order = list(schemas)

@@ -8,6 +8,7 @@ from discovery import (
     list_row_access_policies,
     get_row_access_policy_ddl,
 )
+from utils import rewrite_db_in_ddl
 
 
 def migrate_tags(
@@ -33,7 +34,7 @@ def migrate_tags(
             errors.append(f"{tag}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -68,7 +69,7 @@ def migrate_policies(
             errors.append(f"{policy}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)
@@ -84,7 +85,7 @@ def migrate_policies(
             errors.append(f"{policy}: Could not get DDL")
             continue
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
         if not dry_run:
             try:
                 exec_sql(tgt_conn, ddl)

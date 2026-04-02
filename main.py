@@ -29,6 +29,7 @@ from discovery import (
 from dependencies import (
     validate_cross_db_dependencies,
     build_table_dependency_order_from_views,
+    clear_dependency_cache,
 )
 from migration.orchestrator import migrate_all_objects
 
@@ -473,6 +474,7 @@ with st.expander("Schema Migration Order", expanded=True):
         8. STREAMS
         9. FUNCTIONS (skip external handlers)
         10. PROCEDURES
+        11. CORTEX SEARCH SERVICES
         11. POLICIES (masking, row access)
         12. TASKS
         13. DYNAMIC TABLES
@@ -498,6 +500,7 @@ all_phases = [
     "TABLE_DATA",
     "DYNAMIC_TABLES",  # Before VIEWS - views may reference DTs
     "VIEWS",
+    "CORTEX_SEARCH",  # After VIEWS - depends on tables/views
     "FUNCTIONS",
     "PROCEDURES",
     "STREAMS",
@@ -590,6 +593,7 @@ if migrate_btn and confirm_migrate:
         "TABLE_DDLS",
         "TABLE_DATA",
         "VIEWS",
+        "CORTEX_SEARCH",
         "FUNCTIONS",
         "PROCEDURES",
         "STREAMS",
@@ -609,6 +613,8 @@ if migrate_btn and confirm_migrate:
     log_container.info("Starting migration...")
 
     try:
+        clear_dependency_cache()
+
         result = migrate_all_objects(
             src_conn,
             tgt_conn,
@@ -641,6 +647,25 @@ if migrate_btn and confirm_migrate:
             with st.expander("📋 Migration Logs", expanded=False):
                 for log_msg in logs:
                     st.write(f"• {log_msg}")
+
+        # Show data validation results
+        validation = result.get("data_validation", [])
+        if validation:
+            st.divider()
+            st.subheader("📊 Data Validation Results")
+            mismatches = [v for v in validation if v.get("status") == "MISMATCH"]
+            ok_count = len(validation) - len(mismatches)
+
+            col1, col2 = st.columns(2)
+            col1.metric("✅ Row Count Match", ok_count)
+            col2.metric("❌ Row Count Mismatch", len(mismatches))
+
+            if mismatches:
+                with st.expander("⚠️ Mismatched Tables", expanded=True):
+                    for v in mismatches:
+                        st.error(
+                            f"**{v['table']}**: Source={v['src_count']}, Target={v['tgt_count']}"
+                        )
 
         # Show warnings
         warnings = result.get("warnings", [])

@@ -31,7 +31,7 @@ from dependencies import (
     build_table_dependency_order_from_views,
     build_global_view_dependency_order,
 )
-from utils import fq, bootstrap_db_schema
+from utils import fq, bootstrap_db_schema, save_checkpoint, load_checkpoint
 from .tables import migrate_table_ddls, migrate_table_data_ordered
 from .views import migrate_views, migrate_semantic_views, migrate_materialized_views
 from .procedures import migrate_functions, migrate_procedures
@@ -50,6 +50,7 @@ from .apps import (
     migrate_file_formats,
     migrate_notebooks,
 )
+from .cortex import migrate_cortex_search_services
 
 
 def migrate_all_objects(
@@ -82,7 +83,15 @@ def migrate_all_objects(
         "warnings": [],
         "total_migrated": 0,
         "stopped_at": None,
+        "data_validation": [],
     }
+
+    checkpoint_path = f"checkpoint_{run_id}.json"
+    checkpoint = load_checkpoint(checkpoint_path)
+    completed_phases = set(checkpoint.get("completed_phases", []))
+
+    if completed_phases:
+        log(f"Loaded checkpoint: {len(completed_phases)} phases already completed")
 
     # Default to all phases if none selected
     # NOTE: DYNAMIC_TABLES must come before VIEWS (views may reference dynamic tables)
@@ -96,6 +105,7 @@ def migrate_all_objects(
             "TABLE_DATA",
             "DYNAMIC_TABLES",  # Before VIEWS - views may reference DTs
             "VIEWS",
+            "CORTEX_SEARCH",  # After VIEWS - depends on tables/views
             "FUNCTIONS",
             "PROCEDURES",
             "STREAMS",
@@ -112,6 +122,8 @@ def migrate_all_objects(
     def should_run(phase: str) -> bool:
         if not selected_phases:
             return True  # Run all if nothing selected
+        if phase in completed_phases:
+            return False  # Skip already completed phases
         return phase in selected_phases
 
     def log(msg: str):
@@ -129,6 +141,17 @@ def migrate_all_objects(
             results["errors"].append(f"{phase}: {error}")
         if phase_callback:
             phase_callback(phase, count, error)
+
+        # Save checkpoint after each phase
+        completed_phases.add(phase)
+        save_checkpoint(
+            checkpoint_path,
+            {
+                "completed_phases": list(completed_phases),
+                "last_phase": phase,
+                "total_migrated": results["total_migrated"],
+            },
+        )
 
     rewrite_db = tgt_db != src_db
 
@@ -215,6 +238,11 @@ def migrate_all_objects(
                 raise Exception(f"Data migration failed: {result['errors'][0]}")
             data_count += result["migrated"]
             results["total_migrated"] += result["migrated"]
+
+            # Collect validation results
+            validation = result.get("validation", [])
+            if validation:
+                results.setdefault("data_validation", []).extend(validation)
         log_phase("TABLE_DATA", data_count)
 
     # Phase 7: VIEWS with greedy retry
@@ -292,7 +320,20 @@ def migrate_all_objects(
             log_phase("VIEWS", 0, str(e))
             results["warnings"].append(f"View migration had issues: {e}")
 
-    # Phase 8-9: PROCEDURES & FUNCTIONS
+    # Phase 8: CORTEX SEARCH SERVICES
+    if should_run("CORTEX_SEARCH"):
+        for schema in ordered_schemas:
+            result = migrate_cortex_search_services(
+                src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run, rewrite_db
+            )
+            results["total_migrated"] += result["migrated"]
+            if result["errors"]:
+                results["warnings"].extend(result["errors"])
+            if result.get("skipped"):
+                results["skipped"].extend(result["skipped"])
+        log_phase("CORTEX_SEARCH", sum(1 for _ in ordered_schemas))
+
+    # Phase 9-10: PROCEDURES & FUNCTIONS
     if should_run("FUNCTIONS"):
         for schema in ordered_schemas:
             result = migrate_functions(

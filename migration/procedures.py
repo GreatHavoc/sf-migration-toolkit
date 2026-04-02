@@ -7,6 +7,7 @@ from discovery import (
     list_procedures,
     get_procedure_ddl,
 )
+from utils import rewrite_db_in_ddl
 
 
 def migrate_functions(
@@ -41,7 +42,7 @@ def migrate_functions(
             continue
 
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
 
         if not dry_run:
             try:
@@ -89,7 +90,7 @@ def migrate_procedures(
             continue
 
         if tgt_db != src_db:
-            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
 
         if not dry_run:
             try:

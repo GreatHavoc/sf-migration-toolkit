@@ -2,6 +2,38 @@ import re
 from typing import Optional
 
 
+def rewrite_db_in_ddl(ddl: str, src_db: str, tgt_db: str) -> str:
+    """Rewrite database name in DDL, respecting quoted identifiers."""
+    if not ddl or src_db == tgt_db:
+        return ddl
+    # Only replace unquoted database references
+    return re.sub(
+        rf'(?<!")\b{re.escape(src_db)}\b(?!")', tgt_db, ddl, flags=re.IGNORECASE
+    )
+
+
+def save_checkpoint(checkpoint_path: str, data: dict):
+    """Save migration checkpoint to JSON file."""
+    import json
+
+    try:
+        with open(checkpoint_path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def load_checkpoint(checkpoint_path: str) -> dict:
+    """Load migration checkpoint from JSON file."""
+    import json
+
+    try:
+        with open(checkpoint_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def qident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 

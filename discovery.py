@@ -1,4 +1,6 @@
 from typing import Optional
+import json
+import ast
 from connection import exec_sql, exec_sql_with_cols, fetch_one_val
 from utils import fq, _find_col
 
@@ -145,8 +147,22 @@ def inventory_all_objects(conn, db: str, schema: str) -> dict:
         pass
 
     try:
-        css = exec_sql(conn, f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {fq(db, schema)}")
-        inventory["cortex_search_services"] = [r[1] for r in css if len(r) > 1]
+        cols, rows = exec_sql_with_cols(conn, "SHOW CORTEX SEARCH SERVICES")
+        i_name = _find_col(cols, "name")
+        i_db = _find_col(cols, "database_name")
+        i_schema = _find_col(cols, "schema_name")
+        if i_name is not None and i_db is not None and i_schema is not None:
+            db_u = db.upper()
+            schema_u = schema.upper()
+            for r in rows:
+                if len(r) <= max(i_name, i_db, i_schema):
+                    continue
+                if (
+                    str(r[i_db]).upper() == db_u
+                    and str(r[i_schema]).upper() == schema_u
+                ):
+                    if r[i_name]:
+                        inventory["cortex_search_services"].append(r[i_name])
     except:
         pass
 
@@ -195,7 +211,7 @@ def list_file_formats(conn, db: str, schema: str) -> list[str]:
 def get_file_format_ddl(conn, db: str, schema: str, name: str) -> Optional[str]:
     try:
         return fetch_one_val(
-            conn, "SELECT GET_DDL('FILE FORMAT', %s, TRUE)", (f"{db}.{schema}.{name}",)
+            conn, "SELECT GET_DDL('FILE_FORMAT', %s, TRUE)", (f"{db}.{schema}.{name}",)
         )
     except:
         return None
@@ -250,6 +266,58 @@ def get_task_ddl(conn, db: str, schema: str, name: str) -> Optional[str]:
         )
     except:
         return None
+
+
+def _task_name_only(task_ref: str) -> str:
+    """Normalize a task reference and return object name only."""
+    if not task_ref:
+        return ""
+    parts = [p.strip('"') for p in str(task_ref).split(".") if p]
+    return (parts[-1] if parts else str(task_ref)).upper()
+
+
+def get_task_predecessor_map(conn, db: str, schema: str) -> dict[str, set[str]]:
+    """Return task -> predecessor names mapping from SHOW TASKS metadata."""
+    out: dict[str, set[str]] = {}
+    try:
+        cols, rows = exec_sql_with_cols(conn, f"SHOW TASKS IN SCHEMA {fq(db, schema)}")
+    except Exception:
+        return out
+
+    i_name = _find_col(cols, "name")
+    i_preds = _find_col(cols, "predecessors")
+    if i_name is None:
+        return out
+
+    for r in rows:
+        if len(r) <= i_name or not r[i_name]:
+            continue
+        tname = str(r[i_name]).upper()
+        out.setdefault(tname, set())
+        if i_preds is None or len(r) <= i_preds or not r[i_preds]:
+            continue
+
+        preds_raw = r[i_preds]
+        parsed = []
+        if isinstance(preds_raw, list):
+            parsed = preds_raw
+        elif isinstance(preds_raw, str):
+            s = preds_raw.strip()
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(s)
+                except Exception:
+                    parsed = []
+
+        if isinstance(parsed, list):
+            for p in parsed:
+                pn = _task_name_only(p)
+                if pn:
+                    out[tname].add(pn)
+
+    return out
 
 
 def list_procedures(conn, db: str, schema: str) -> list[str]:
@@ -354,13 +422,71 @@ def list_functions(conn, db: str, schema: str) -> list[str]:
     return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
 
 
-def get_function_ddl(conn, db: str, schema: str, name: str) -> Optional[str]:
+def get_function_ddl(conn, db: str, schema: str, name: str) -> dict:
+    """Return metadata for a function: {'ddl': str|None, 'signature': str|None, 'error': str|None}.
+
+    Uses SHOW FUNCTIONS to locate signature/arguments for overloaded functions,
+    then GET_DDL with signature when available.
+    """
+    out = {"ddl": None, "signature": None, "error": None}
     try:
-        return fetch_one_val(
-            conn, "SELECT GET_DDL('FUNCTION', %s, TRUE)", (f"{db}.{schema}.{name}",)
+        cols, rows = exec_sql_with_cols(
+            conn, f"SHOW FUNCTIONS IN SCHEMA {fq(db, schema)}"
         )
-    except:
-        return None
+        i_name = _find_col(cols, "name")
+        i_sig = (
+            _find_col(cols, "signature")
+            or _find_col(cols, "arguments")
+            or _find_col(cols, "arguments_text")
+        )
+
+        target_name = str(name).upper()
+        for r in rows:
+            fname = r[i_name] if (i_name is not None and len(r) > i_name) else None
+            if not fname:
+                continue
+            if str(fname).upper() != target_name:
+                continue
+
+            sig = None
+            if i_sig is not None and len(r) > i_sig and r[i_sig]:
+                sig = str(r[i_sig]).strip()
+                out["signature"] = sig
+
+            ident = f"{db}.{schema}.{name}{sig}" if sig else f"{db}.{schema}.{name}"
+            try:
+                out["ddl"] = fetch_one_val(
+                    conn, "SELECT GET_DDL('FUNCTION', %s, TRUE)", (ident,)
+                )
+                return out
+            except Exception:
+                # fallback without signature
+                try:
+                    out["ddl"] = fetch_one_val(
+                        conn,
+                        "SELECT GET_DDL('FUNCTION', %s, TRUE)",
+                        (f"{db}.{schema}.{name}",),
+                    )
+                    return out
+                except Exception as e:
+                    out["error"] = str(e)
+                    out["ddl"] = None
+                    return out
+
+        # not found in SHOW output: last resort direct GET_DDL
+        try:
+            out["ddl"] = fetch_one_val(
+                conn,
+                "SELECT GET_DDL('FUNCTION', %s, TRUE)",
+                (f"{db}.{schema}.{name}",),
+            )
+            return out
+        except Exception as e:
+            out["error"] = str(e)
+            return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
 
 
 def list_pipes(conn, db: str, schema: str) -> list[str]:
@@ -397,7 +523,7 @@ def get_dynamic_table_ddl(conn, db: str, schema: str, name: str) -> Optional[str
     try:
         return fetch_one_val(
             conn,
-            "SELECT GET_DDL('DYNAMIC TABLE', %s, TRUE)",
+            "SELECT GET_DDL('DYNAMIC_TABLE', %s, TRUE)",
             (f"{db}.{schema}.{name}",),
         )
     except:
@@ -485,7 +611,7 @@ def get_materialized_view_ddl(conn, db: str, schema: str, name: str) -> Optional
     try:
         return fetch_one_val(
             conn,
-            "SELECT GET_DDL('MATERIALIZED VIEW', %s, TRUE)",
+            "SELECT GET_DDL('VIEW', %s, TRUE)",
             (f"{db}.{schema}.{name}",),
         )
     except:
@@ -665,14 +791,27 @@ def get_stage_ddl(conn, db: str, schema: str, stage_name: str) -> Optional[str]:
 
 
 def list_cortex_search_services(conn, db: str, schema: str) -> list[str]:
-    """List Cortex Search services in a schema."""
-    cols, rows = exec_sql_with_cols(
-        conn, f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {fq(db, schema)}"
-    )
+    """List Cortex Search services in a schema.
+
+    SHOW CORTEX SEARCH SERVICES does not document IN SCHEMA filtering, so we
+    run SHOW and filter rows by database_name/schema_name.
+    """
+    cols, rows = exec_sql_with_cols(conn, "SHOW CORTEX SEARCH SERVICES")
+    i_db = _find_col(cols, "database_name")
+    i_schema = _find_col(cols, "schema_name")
     i_name = _find_col(cols, "name")
-    if i_name is None:
+    if i_name is None or i_db is None or i_schema is None:
         return []
-    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
+    db_u = db.upper()
+    schema_u = schema.upper()
+    out = []
+    for r in rows:
+        if len(r) <= max(i_name, i_db, i_schema):
+            continue
+        if str(r[i_db]).upper() == db_u and str(r[i_schema]).upper() == schema_u:
+            if r[i_name]:
+                out.append(r[i_name])
+    return out
 
 
 def get_cortex_search_service_info(
@@ -686,23 +825,44 @@ def get_cortex_search_service_info(
     try:
         cols, rows = exec_sql_with_cols(
             conn,
-            f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {fq(db, schema)}",
+            "SHOW CORTEX SEARCH SERVICES",
         )
     except Exception:
         return None
 
     col_map = {c.lower(): i for i, c in enumerate(cols)}
     target = name.upper()
+    db_u = db.upper()
+    schema_u = schema.upper()
+    i_db = col_map.get("database_name")
+    i_schema = col_map.get("schema_name")
 
     for r in rows:
         i_name = col_map.get("name")
         if i_name is None or len(r) <= i_name:
             continue
         if str(r[i_name]).upper() == target:
+            if i_db is not None and i_schema is not None:
+                if len(r) <= max(i_db, i_schema):
+                    continue
+                if str(r[i_db]).upper() != db_u or str(r[i_schema]).upper() != schema_u:
+                    continue
             info = {}
             for col_name, idx in col_map.items():
                 if idx < len(r):
                     info[col_name] = r[idx]
+            # Enrich with DESCRIBE output when available
+            try:
+                dcols, drows = exec_sql_with_cols(
+                    conn,
+                    f"DESCRIBE CORTEX SEARCH SERVICE {fq(db, schema, name)}",
+                )
+                for dr in drows:
+                    if len(dr) >= 2 and dr[0]:
+                        key = str(dr[0]).lower()
+                        info[key] = dr[1]
+            except Exception:
+                pass
             return info
     return None
 
@@ -734,7 +894,13 @@ def build_cortex_search_ddl(info: dict, db: str, schema: str) -> Optional[str]:
 
     parts = [f"CREATE OR REPLACE CORTEX SEARCH SERVICE {fq(db, schema, name)}"]
 
-    if search_col:
+    # Prefer multi-index form when index columns are available in metadata.
+    text_indexes = info.get("text_indexes")
+    vector_indexes = info.get("vector_indexes")
+    if text_indexes and vector_indexes:
+        parts.append(f"  TEXT INDEXES {text_indexes}")
+        parts.append(f"  VECTOR INDEXES {vector_indexes}")
+    elif search_col:
         parts.append(f"  ON {search_col}")
 
     if attr_cols:
@@ -748,6 +914,23 @@ def build_cortex_search_ddl(info: dict, db: str, schema: str) -> Optional[str]:
 
     if target_lag:
         parts.append(f"  TARGET_LAG = '{target_lag}'")
+
+    # Optional properties when available
+    embedding_model = info.get("embedding_model")
+    if embedding_model:
+        parts.append(f"  EMBEDDING_MODEL = '{embedding_model}'")
+
+    refresh_mode = info.get("refresh_mode")
+    if refresh_mode:
+        parts.append(f"  REFRESH_MODE = {refresh_mode}")
+
+    initialize = info.get("initialize")
+    if initialize:
+        parts.append(f"  INITIALIZE = {initialize}")
+
+    full_idx_days = info.get("full_index_build_interval_days")
+    if full_idx_days not in (None, "", "NULL"):
+        parts.append(f"  FULL_INDEX_BUILD_INTERVAL_DAYS = {full_idx_days}")
 
     if comment:
         escaped = comment.replace("'", "''")

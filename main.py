@@ -468,19 +468,19 @@ with st.expander("Schema Migration Order", expanded=True):
         2. FILE FORMATS
         3. TAGS
         4. TABLES (DDL, skip Iceberg)
-        5. MATERIALIZED VIEWS
-        6. VIEWS (with dependency resolution)
-        7. SEMANTIC VIEWS
-        8. STREAMS
-        9. FUNCTIONS (skip external handlers)
-        10. PROCEDURES
-        11. CORTEX SEARCH SERVICES
-        11. POLICIES (masking, row access)
-        12. TASKS
-        13. DYNAMIC TABLES
+        5. TABLE DATA (FK-ordered)
+        6. DYNAMIC TABLES
+        7. MATERIALIZED VIEWS
+        8. VIEWS (topo-first + dependency retry)
+        9. CORTEX SEARCH SERVICES
+        10. FUNCTIONS (skip external handlers)
+        11. PROCEDURES
+        11. STREAMS
+        12. POLICIES (masking, row access)
+        13. TASKS
         14. PIPES
         15. ALERTS
-        16. TABLE DATA
+        16. SEMANTIC VIEWS
         17. STREAMLITS
         18. AGENTS
         
@@ -499,6 +499,7 @@ all_phases = [
     "TABLE_DDLS",
     "TABLE_DATA",
     "DYNAMIC_TABLES",  # Before VIEWS - views may reference DTs
+    "MATERIALIZED_VIEWS",  # Before VIEWS when views depend on MVs
     "VIEWS",
     "CORTEX_SEARCH",  # After VIEWS - depends on tables/views
     "FUNCTIONS",
@@ -508,7 +509,6 @@ all_phases = [
     "TASKS",
     "PIPES",
     "ALERTS",
-    "MATERIALIZED_VIEWS",
     "SEMANTIC_VIEWS",
     "STREAMLITS",
     "AGENTS",
@@ -592,6 +592,8 @@ if migrate_btn and confirm_migrate:
         "TAGS",
         "TABLE_DDLS",
         "TABLE_DATA",
+        "DYNAMIC_TABLES",
+        "MATERIALIZED_VIEWS",
         "VIEWS",
         "CORTEX_SEARCH",
         "FUNCTIONS",
@@ -599,10 +601,8 @@ if migrate_btn and confirm_migrate:
         "STREAMS",
         "POLICIES",
         "TASKS",
-        "DYNAMIC_TABLES",
         "PIPES",
         "ALERTS",
-        "MATERIALIZED_VIEWS",
         "SEMANTIC_VIEWS",
         "STREAMLITS",
         "AGENTS",

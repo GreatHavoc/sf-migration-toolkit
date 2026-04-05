@@ -11,6 +11,7 @@ from discovery import (
     get_dynamic_table_ddl,
     list_pipes,
     get_pipe_ddl,
+    get_task_predecessor_map,
 )
 from utils import rewrite_db_in_ddl
 
@@ -51,52 +52,43 @@ def migrate_streams(
     return {"migrated": migrated, "errors": errors}
 
 
-def _get_task_predecessors(ddl: str) -> list:
-    """Extract predecessor tasks from task DDL."""
-    if not ddl:
-        return []
-    preds = []
-    # Match "after <task_name>" or "AFTER <task_name>"
-    import re
-
-    matches = re.findall(r"AFTER\s+([A-Za-z0-9_\.]+)", ddl, re.IGNORECASE)
-    for m in matches:
-        preds.append(m.split(".")[-1].upper())  # Just the task name
-    return preds
-
-
 def _resolve_task_order(tasks: list, get_ddl_func, src_conn, src_db, schema) -> list:
     """Resolve task creation order based on dependencies."""
     if not tasks:
         return tasks
 
-    # Build dependency graph
-    deps = {t: set() for t in tasks}
-    for task in tasks:
-        ddl = get_ddl_func(src_conn, src_db, schema, task) or ""
-        preds = _get_task_predecessors(ddl)
+    # Normalize task names for graph logic, keep original for execution order mapping.
+    task_map = {t.upper(): t for t in tasks}
+    task_keys = list(task_map.keys())
+
+    # Build dependency graph from SHOW TASKS predecessors metadata
+    pred_map = get_task_predecessor_map(src_conn, src_db, schema)
+    deps = {t: set() for t in task_keys}
+    for task_u in task_keys:
+        preds = pred_map.get(task_u, set())
         for p in preds:
-            if p in tasks:
-                deps[task].add(p)
+            p_u = str(p).upper()
+            if p_u in task_map:
+                deps[task_u].add(p_u)
 
     # Topological sort (Kahn's algorithm)
-    indeg = {t: len(deps[t]) for t in tasks}
-    q = [t for t in tasks if indeg[t] == 0]
+    indeg = {t: len(deps[t]) for t in task_keys}
+    q = [t for t in task_keys if indeg[t] == 0]
     order = []
 
     while q:
         curr = q.pop(0)
         order.append(curr)
-        for t in tasks:
+        for t in task_keys:
             if curr in deps[t]:
                 indeg[t] -= 1
                 if indeg[t] == 0:
                     q.append(t)
 
     # If cycle or unresolved, fallback to original order
-    if len(order) != len(tasks):
+    if len(order) != len(task_keys):
         return tasks
-    return order
+    return [task_map[k] for k in order]
 
 
 def migrate_tasks(

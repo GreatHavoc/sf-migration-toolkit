@@ -24,16 +24,21 @@ Migration Phases:
 """
 
 from typing import Optional
-import re
 from connection import exec_sql, exec_script
 from discovery import get_all_schemas, inventory_all_objects
 from dependencies import (
     build_table_dependency_order_from_views,
     build_global_view_dependency_order,
 )
-from utils import fq, bootstrap_db_schema, save_checkpoint, load_checkpoint
+from utils import (
+    fq,
+    bootstrap_db_schema,
+    save_checkpoint,
+    load_checkpoint,
+    rewrite_db_in_ddl,
+)
 from .tables import migrate_table_ddls, migrate_table_data_ordered
-from .views import migrate_views, migrate_semantic_views, migrate_materialized_views
+from .views import migrate_semantic_views, migrate_materialized_views
 from .procedures import migrate_functions, migrate_procedures
 from .policies import migrate_tags, migrate_policies
 from .tasks import (
@@ -48,7 +53,6 @@ from .apps import (
     migrate_agents,
     migrate_sequences,
     migrate_file_formats,
-    migrate_notebooks,
 )
 from .cortex import migrate_cortex_search_services
 
@@ -90,9 +94,6 @@ def migrate_all_objects(
     checkpoint = load_checkpoint(checkpoint_path)
     completed_phases = set(checkpoint.get("completed_phases", []))
 
-    if completed_phases:
-        log(f"Loaded checkpoint: {len(completed_phases)} phases already completed")
-
     # Default to all phases if none selected
     # NOTE: DYNAMIC_TABLES must come before VIEWS (views may reference dynamic tables)
     if not selected_phases:
@@ -104,6 +105,7 @@ def migrate_all_objects(
             "TABLE_DDLS",
             "TABLE_DATA",
             "DYNAMIC_TABLES",  # Before VIEWS - views may reference DTs
+            "MATERIALIZED_VIEWS",  # Before VIEWS when views depend on MVs
             "VIEWS",
             "CORTEX_SEARCH",  # After VIEWS - depends on tables/views
             "FUNCTIONS",
@@ -129,6 +131,9 @@ def migrate_all_objects(
     def log(msg: str):
         results["logs"].append(msg)
 
+    if completed_phases:
+        log(f"Loaded checkpoint: {len(completed_phases)} phases already completed")
+
     def log_phase(phase: str, count: int, error: str = None):
         results["phases"].append(
             {
@@ -142,8 +147,9 @@ def migrate_all_objects(
         if phase_callback:
             phase_callback(phase, count, error)
 
-        # Save checkpoint after each phase
-        completed_phases.add(phase)
+        # Save checkpoint after each successfully completed phase only
+        if not error:
+            completed_phases.add(phase)
         save_checkpoint(
             checkpoint_path,
             {
@@ -245,11 +251,38 @@ def migrate_all_objects(
                 results.setdefault("data_validation", []).extend(validation)
         log_phase("TABLE_DATA", data_count)
 
-    # Phase 7: VIEWS with greedy retry
+    # Phase 7: DYNAMIC TABLES (before VIEWS)
+    if should_run("DYNAMIC_TABLES"):
+        for schema in ordered_schemas:
+            result = migrate_dynamic_tables(
+                src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run
+            )
+            if result["errors"]:
+                log_phase("DYNAMIC_TABLES", 0, result["errors"][0])
+                raise Exception(f"Dynamic Tables failed: {result['errors'][0]}")
+            results["total_migrated"] += result["migrated"]
+        log_phase("DYNAMIC_TABLES", sum(1 for _ in ordered_schemas))
+
+    # Phase 8: MATERIALIZED VIEWS (before regular views)
+    if should_run("MATERIALIZED_VIEWS"):
+        mv_count = 0
+        for schema in ordered_schemas:
+            result = migrate_materialized_views(
+                src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run, rewrite_db
+            )
+            mv_count += result["migrated"]
+            results["total_migrated"] += result["migrated"]
+            if result["errors"]:
+                results["warnings"].extend(result["errors"])
+        log_phase("MATERIALIZED_VIEWS", mv_count)
+
+    # Phase 9: VIEWS with topo-first then retry
     if should_run("VIEWS"):
-        log("Phase 7: Migrating views (greedy retry)...")
+        log("Phase 9: Migrating views (topo-first + retry)...")
         try:
             g = build_global_view_dependency_order(src_conn, src_db, ordered_schemas)
+            topo_order = g.get("order", [])
+            cycles = g.get("cycles", [])
             all_views = g.get("all_views", [])
             ddls = g.get("ddls", {})
 
@@ -263,9 +296,29 @@ def migrate_all_objects(
                 view_errors = []
                 max_retries = 4
 
-                # Get list of views to try
-                views_to_create = list(all_views)
-                log(f"Starting view migration with {len(views_to_create)} views...")
+                # Pass 1: create in topological order first
+                views_to_create = list(topo_order)
+                failed_initial = []
+                for fqn in views_to_create:
+                    ddl = ddls.get(fqn, "")
+                    if rewrite_db and tgt_db != src_db:
+                        ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
+                    if not dry_run:
+                        try:
+                            exec_script(tgt_conn, ddl, remove_comments=True)
+                            view_count += 1
+                        except Exception as e:
+                            failed_initial.append((fqn, str(e)))
+                    else:
+                        view_count += 1
+
+                # Build retry set from cycles + failed topo views
+                retry_set = set(cycles)
+                retry_set.update([fqn for fqn, _ in failed_initial])
+                views_to_create = list(retry_set)
+                log(
+                    f"Topo pass done: {view_count} succeeded, {len(views_to_create)} queued for retry"
+                )
 
                 for attempt in range(1, max_retries + 1):
                     if not views_to_create:
@@ -273,13 +326,9 @@ def migrate_all_objects(
 
                     failed_this_round = []
                     for fqn in views_to_create:
-                        parts = fqn.split(".")
-                        if len(parts) != 3:
-                            continue
-                        db0, sch0, vname = parts
                         ddl = ddls.get(fqn, "")
                         if rewrite_db and tgt_db != src_db:
-                            ddl = re.sub(rf"(?i)\b{re.escape(src_db)}\b", tgt_db, ddl)
+                            ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
                         if not dry_run:
                             try:
                                 exec_script(tgt_conn, ddl, remove_comments=True)
@@ -320,7 +369,7 @@ def migrate_all_objects(
             log_phase("VIEWS", 0, str(e))
             results["warnings"].append(f"View migration had issues: {e}")
 
-    # Phase 8: CORTEX SEARCH SERVICES
+    # Phase 10: CORTEX SEARCH SERVICES
     if should_run("CORTEX_SEARCH"):
         for schema in ordered_schemas:
             result = migrate_cortex_search_services(
@@ -333,7 +382,7 @@ def migrate_all_objects(
                 results["skipped"].extend(result["skipped"])
         log_phase("CORTEX_SEARCH", sum(1 for _ in ordered_schemas))
 
-    # Phase 9-10: PROCEDURES & FUNCTIONS
+    # Phase 11-12: PROCEDURES & FUNCTIONS
     if should_run("FUNCTIONS"):
         for schema in ordered_schemas:
             result = migrate_functions(
@@ -360,17 +409,19 @@ def migrate_all_objects(
                 results["skipped"].extend(result["skipped"])
         log_phase("PROCEDURES", sum(1 for _ in ordered_schemas))
 
-    # Phase 10-15: TASKS, STREAMS, POLICIES, etc.
+    # Phase 13-17: TASKS, STREAMS, POLICIES, etc.
     if should_run("STREAMS"):
+        streams_count = 0
         for schema in ordered_schemas:
             result = migrate_streams(
                 src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run
             )
-        if result["errors"]:
-            log_phase("STREAMS", 0, result["errors"][0])
-            raise Exception(f"Streams failed: {result['errors'][0]}")
-        results["total_migrated"] += result["migrated"]
-    log_phase("STREAMS", sum(1 for _ in ordered_schemas))
+            if result["errors"]:
+                log_phase("STREAMS", streams_count, result["errors"][0])
+                raise Exception(f"Streams failed: {result['errors'][0]}")
+            streams_count += result["migrated"]
+            results["total_migrated"] += result["migrated"]
+        log_phase("STREAMS", streams_count)
 
     if should_run("POLICIES"):
         for schema in ordered_schemas:
@@ -395,17 +446,6 @@ def migrate_all_objects(
             results["total_migrated"] += result["migrated"]
         log_phase("TASKS", sum(1 for _ in ordered_schemas))
 
-    if should_run("DYNAMIC_TABLES"):
-        for schema in ordered_schemas:
-            result = migrate_dynamic_tables(
-                src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run
-            )
-            if result["errors"]:
-                log_phase("DYNAMIC_TABLES", 0, result["errors"][0])
-                raise Exception(f"Dynamic Tables failed: {result['errors'][0]}")
-            results["total_migrated"] += result["migrated"]
-        log_phase("DYNAMIC_TABLES", sum(1 for _ in ordered_schemas))
-
     if should_run("PIPES"):
         for schema in ordered_schemas:
             result = migrate_pipes(
@@ -428,17 +468,7 @@ def migrate_all_objects(
             results["total_migrated"] += result["migrated"]
         log_phase("ALERTS", sum(1 for _ in ordered_schemas))
 
-    # Phase 16-17: MATERIALIZED & SEMANTIC VIEWS (if not covered in global view pass)
-    if should_run("MATERIALIZED_VIEWS"):
-        for schema in ordered_schemas:
-            result = migrate_materialized_views(
-                src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run, rewrite_db
-            )
-            results["total_migrated"] += result["migrated"]
-            if result["errors"]:
-                results["warnings"].extend(result["errors"])
-        log_phase("MATERIALIZED_VIEWS", sum(1 for _ in ordered_schemas))
-
+    # Phase 18: SEMANTIC VIEWS
     if should_run("SEMANTIC_VIEWS"):
         for schema in ordered_schemas:
             result = migrate_semantic_views(

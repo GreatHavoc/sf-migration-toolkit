@@ -5,6 +5,8 @@ from discovery import (
     list_views,
     get_view_ddl,
     list_tables,
+    list_dynamic_tables,
+    get_dynamic_table_ddl,
 )
 
 import sqlglot
@@ -420,7 +422,7 @@ def build_table_dependency_order_from_views(conn, db: str, schemas: list) -> lis
             tbls = []
         schema_tables[sch] = {t.upper() for t in tbls}
 
-    # Try using Snowflake metadata first (fast path)
+    # Try using Snowflake metadata first (fast path) for view->table refs
     view_refs: dict = {}
     use_metadata = True
 
@@ -480,6 +482,75 @@ def build_table_dependency_order_from_views(conn, db: str, schemas: list) -> lis
                         if r_name in schema_tables[r_sch]:
                             referenced_schemas.add(r_sch)
         deps[sch] = referenced_schemas
+
+    # Add cross-schema view->view refs (same DB) so schemas producing base views
+    # are ordered before schemas consuming them.
+    schema_view_names = {}
+    for sch in schemas:
+        try:
+            vs = list_views(conn, db, sch)
+        except Exception:
+            vs = []
+        schema_view_names[sch.upper()] = {v.upper() for v in vs}
+
+    for sch in schemas:
+        sch_u = sch.upper()
+        try:
+            vs = list_views(conn, db, sch)
+        except Exception:
+            vs = []
+        for v in vs:
+            try:
+                ddl = get_view_ddl(conn, db, sch, v) or ""
+            except Exception:
+                ddl = ""
+            if not ddl:
+                continue
+            refs = _extract_fqns_from_sql_cached(ddl, db, sch)
+            for rdb, rsch, rname in refs:
+                rdb_u = (rdb or db).upper()
+                rsch_u = (rsch or sch).upper()
+                rname_u = rname.upper()
+                if rdb_u != db.upper() or rsch_u == sch_u:
+                    continue
+                if rsch_u in schema_view_names and rname_u in schema_view_names[rsch_u]:
+                    deps[sch].add(rsch_u)
+
+    # Add dynamic-table dependencies (DT->table/DT across schemas)
+    schema_dt_names = {}
+    for sch in schemas:
+        try:
+            dts = list_dynamic_tables(conn, db, sch)
+        except Exception:
+            dts = []
+        schema_dt_names[sch.upper()] = {d.upper() for d in dts}
+
+    for sch in schemas:
+        sch_u = sch.upper()
+        try:
+            dts = list_dynamic_tables(conn, db, sch)
+        except Exception:
+            dts = []
+        for dt in dts:
+            try:
+                ddl = get_dynamic_table_ddl(conn, db, sch, dt) or ""
+            except Exception:
+                ddl = ""
+            if not ddl:
+                continue
+            refs = _extract_fqns_from_sql_cached(ddl, db, sch)
+            for rdb, rsch, rname in refs:
+                rdb_u = (rdb or db).upper()
+                rsch_u = (rsch or sch).upper()
+                rname_u = rname.upper()
+                if rdb_u != db.upper() or rsch_u == sch_u:
+                    continue
+                # referenced cross-schema table
+                if rsch_u in schema_tables and rname_u in schema_tables[rsch_u]:
+                    deps[sch].add(rsch_u)
+                # referenced cross-schema dynamic table
+                if rsch_u in schema_dt_names and rname_u in schema_dt_names[rsch_u]:
+                    deps[sch].add(rsch_u)
 
     # Build reverse lookup: for each schema, which schemas depend on it?
     dependents = {s: set() for s in schemas}

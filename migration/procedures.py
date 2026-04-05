@@ -29,12 +29,14 @@ def migrate_functions(
     skipped = []
 
     for func in funcs:
-        ddl = get_function_ddl(src_conn, src_db, schema, func)
+        meta = get_function_ddl(src_conn, src_db, schema, func)
+        ddl = meta.get("ddl") if isinstance(meta, dict) else None
         if not ddl:
             # Could not retrieve DDL (permissions, signature mismatch, or
             # unsupported function type). Skip creation but don't treat as a
             # hard error so migration can continue for other objects.
-            skipped.append(f"{func}: Could not get DDL")
+            reason = meta.get("error") if isinstance(meta, dict) else "unknown"
+            skipped.append(f"{func}: Could not get DDL ({reason})")
             continue
 
         if has_external_handler(ddl):

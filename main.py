@@ -475,14 +475,14 @@ with st.expander("Schema Migration Order", expanded=True):
         9. CORTEX SEARCH SERVICES
         10. FUNCTIONS (skip external handlers)
         11. PROCEDURES
-        11. STREAMS
-        12. POLICIES (masking, row access)
-        13. TASKS
-        14. PIPES
-        15. ALERTS
-        16. SEMANTIC VIEWS
-        17. STREAMLITS
-        18. AGENTS
+        12. STREAMS
+        13. POLICIES (masking, row access)
+        14. TASKS
+        15. PIPES
+        16. ALERTS
+        17. SEMANTIC VIEWS
+        18. STREAMLITS
+        19. AGENTS
         
         **Note:** Migration stops on critical errors, but collects warnings.
         """)

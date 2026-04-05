@@ -353,11 +353,12 @@ def build_global_view_dependency_order(conn, db: str, schemas: list) -> dict:
                 ddl = ""
             ddls[fqn] = ddl
 
-    all_views = list(nodes)
+    all_views = sorted(nodes)
+    node_list = all_views
 
     # Build edges among nodes when a view references another view in the set
-    edges = {n: set() for n in nodes}
-    indeg = {n: 0 for n in nodes}
+    edges = {n: set() for n in node_list}
+    indeg = {n: 0 for n in node_list}
 
     for fqn, ddl in ddls.items():
         parts = fqn.split(".")
@@ -373,28 +374,28 @@ def build_global_view_dependency_order(conn, db: str, schemas: list) -> dict:
                 edges[fqn].add(ref_fqn)
 
     # Build reverse lookup: for each node, which nodes depend on it?
-    dependents = {n: set() for n in nodes}
+    dependents = {n: set() for n in node_list}
     for fqn, prereqs in edges.items():
         for prereq in prereqs:
             dependents[prereq].add(fqn)
 
     # indeg = number of prerequisites each node has
-    indeg = {n: len(edges[n]) for n in nodes}
+    indeg = {n: len(edges[n]) for n in node_list}
 
-    q = [n for n, d in indeg.items() if d == 0]
+    q = [n for n in node_list if indeg[n] == 0]
     order = []
     while q:
         n = q.pop(0)
         order.append(n)
         # Satisfy dependents
-        for m in dependents[n]:
+        for m in sorted(dependents[n]):
             indeg[m] -= 1
             if indeg[m] == 0:
                 q.append(m)
 
     cycles = []
     if len(order) != len(nodes):
-        remaining = [n for n in nodes if n not in order]
+        remaining = [n for n in node_list if n not in order]
         cycles = remaining
 
     return {"order": order, "ddls": ddls, "cycles": cycles, "all_views": all_views}

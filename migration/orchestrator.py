@@ -372,7 +372,8 @@ def migrate_all_objects(
                     # Build retry set from cycles + failed topo views
                     retry_set = set(cycles)
                     retry_set.update([fqn for fqn, _ in failed_initial])
-                    views_to_create = list(retry_set)
+                    # deterministic retry order based on global all_views order
+                    views_to_create = [v for v in all_views if v in retry_set]
                     log(
                         f"Topo pass done: {view_count} succeeded, {len(views_to_create)} queued for retry"
                     )

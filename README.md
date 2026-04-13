@@ -1,119 +1,178 @@
 # Snowflake Migration Utility
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Standalone, open-source Snowflake migration toolkit with a new web control plane:
 
-> A utility for migrating and managing Snowflake database objects, agents, and semantic views, with backup and restore support.
+- Backend: FastAPI (`backend/`)
+- Frontend: Next.js App Router + TypeScript + Ant Design (`frontend/`)
+- Migration engine: existing Python modules in repo root (`migration/`, `dependencies.py`, `discovery.py`, `utils.py`, `connection.py`)
+
+This is a standalone FastAPI + Next.js architecture while keeping migration behavior and checkpoint/resume semantics.
 
 ---
 
-## Table of Contents
-- Features
-- Project Structure
-- Installation
-- Usage
-- Backup Folder
-- Contributing
-- License
+## What is included
 
-## Features
-- Command-line and Streamlit‑based migration tools (`main.py` and `mainv2.py`)
-- Backup and restore Snowflake schemas, agents, semantic views, Streamlit apps, notebooks, and table data
-- Migrate notebooks automatically via internal stages
-- Support for Azure external stages with configurable storage integration
-- Local backup/restore independent of cloud stages
-- Environment variable support and optional MFA passcodes
-- Easy-to-use Python/Streamlit scripts with interactive UI
+- **Guided Wizard UI:** Context-driven Next.js step flow (Connect → Setup → Precheck → Run → Monitor)
+- **One-Click Infrastructure Setup:** Consolidates Azure integration and external stage validation into a single action
+- **Unified Connection Testing:** Test source and target concurrently; MFA updates are frictionless
+- Migration orchestration across schemas/phases with checkpoint files (`checkpoint_<run_id>.json`)
+- Source/target Snowflake connection validation
+- Azure integration + external stage setup and inspection
+- Pre-migration analysis (dependency checks + schema ordering)
+- Standalone long-running job runtime (in-process workers, no Redis/Celery)
+- SQLite persistence for jobs/event history
+- SSE event stream for live frontend monitoring
 
-## Project Structure
+---
+
+## Project structure
+
+```text
+backend/                 FastAPI app, job store, SSE APIs
+frontend/                Next.js + Ant Design web UI
+migration/               Migration phase implementations
+connection.py            Snowflake connection helpers
+dependencies.py          Dependency analysis + schema ordering
+discovery.py             Snowflake object discovery + DDL helpers
+utils.py                 Shared migration utility helpers
 ```
-main.py, mainv2.py         # Migration scripts
-pyproject.toml             # Project dependencies
-sf_backup/                 # Database backups (ignored by git)
-```
 
-## Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/snowflake_migrate.git
-   cd snowflake_migrate
-   ```
-2. (Optional) Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+---
 
-## Usage
-There are two entry points:
+## Prerequisites
 
-* `main.py` – a simpler migration script with a Streamlit UI for cross-account Snowflake migrations.
-* `mainv2.py` – an enhanced version offering additional features such as notebook migration, local backup/restore, Azure stage configuration, and more interactive controls.
+- Python 3.13+
+- Node.js 20+
+- `uv` (Python package/env manager)
+- Corepack-enabled `pnpm` (frontend package manager)
 
-### Command-line
-You can invoke either script directly from the shell. Connection parameters are taken from flags or environment variables:
+---
+
+## Setup
+
+### 1) Python dependencies
+
+Install root dependencies (migration engine + API deps) with `uv`:
+
 ```bash
-python main.py [--account <account>] [--user <user>] [--password <pwd>]
-python mainv2.py [options]
+uv pip install -r requirements.txt
 ```
-Supported environment variables:
-- `SNOWFLAKE_ACCOUNT`
-- `SNOWFLAKE_USER`
-- `SNOWFLAKE_PASSWORD`
-- `SNOWFLAKE_ROLE` (optional)
-- `SNOWFLAKE_WAREHOUSE` (optional)
-- `SNOWFLAKE_PASSCODE` (for MFA, mainv2 only)
 
-Run with `--help` to see available flags:
+Or install backend-only API dependencies:
+
 ```bash
-python mainv2.py --help
+uv pip install -r backend/requirements.txt
 ```
 
-### Streamlit UI
-Both scripts can also be launched as a web application:
+### 2) Frontend dependencies
+
 ```bash
-streamlit run main.py
-# or
-streamlit run mainv2.py
+cd frontend
+corepack enable
+corepack prepare pnpm@10.33.0 --activate
+pnpm install
 ```
 
-The UI allows you to:
-- Enter source/target credentials and optional MFA passcodes
-- Configure utility database/schema and Azure external stage settings
-- Perform migrations of schemas, semantic views, agents, Streamlit apps, notebooks, and table data
-- Execute local backups to the filesystem and restore from them
-- Run copy operations via Azure stages for cross-account data movement
+---
 
-The `mainv2.py` UI adds tabs for **Local Backup & Restore**, **Migration Copy**, and more detailed controls.
+## Run locally
 
-### Examples
+### One-click startup on Windows
+
+From repo root, double-click or run either script:
+
+- Docker mode: `run-local-docker.bat`
+- Native mode (`uv` + `pnpm`): `run-local-native.bat`
+
+Matching stop scripts:
+
+- Docker mode stop: `stop-local-docker.bat`
+- Native mode stop: `stop-local-native.bat`
+
+Docker script starts Docker Desktop (if needed) and runs compose.
+Native script installs dependencies (if needed), starts backend + frontend in separate terminals, and opens the browser.
+
+### One-command startup (Docker Compose)
+
+From repo root:
+
 ```bash
-export SNOWFLAKE_ACCOUNT=myacct
-export SNOWFLAKE_USER=admin
-export SNOWFLAKE_PASSWORD=secret
-python main.py              # basic migration
-python mainv2.py            # starts interactive script
-streamlit run mainv2.py     # full UI with backups & notebooks
+run-local-docker.bat
+# or: docker compose up --build
 ```
 
-Refer to the form help text in the UI for additional hints on fields and operations. You can also inspect the source code to see all configurable options.
+Then open:
 
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000/api/health`
 
-## Backup Folder
-- All backups are stored in the sf_backup directory.
-- This folder is excluded from version control via .gitignore.
-- Contains schemas, agents, data, and semantic views for each database.
+Data/runtime mounts used by compose:
 
-## Contributing
-Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
+- `./backend/data` -> SQLite job/event store (`app.db`)
+- `./backend/runtime` -> runtime artifacts (including checkpoint files)
+
+### Backend API
+
+From repo root:
+
+```bash
+.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+```
+
+Alternative:
+
+```bash
+uv run uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+API base URL: `http://localhost:8000/api`
+
+### Frontend UI
+
+From `frontend/`:
+
+```bash
+pnpm dev --hostname 0.0.0.0 --port 3000
+```
+
+Open `http://localhost:3000`.
+
+If your backend is not on port 8000, set:
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api
+```
+
+---
+
+## Key API endpoints (v1)
+
+- `GET /api/health`
+- `GET /api/health/defaults`
+- `POST /api/connections/test`
+- `POST /api/integration/ensure`
+- `POST /api/integration/stage/ensure`
+- `POST /api/integration/stage/inspect`
+- `POST /api/integration/stage/list`
+- `POST /api/analysis/precheck`
+- `POST /api/analysis/schema-order`
+- `POST /api/migrations/start`
+- `POST /api/migrations/{job_id}/cancel`
+- `POST /api/migrations/{job_id}/resume`
+- `GET /api/migrations`
+- `GET /api/migrations/{job_id}`
+- `GET /api/migrations/{job_id}/events` (SSE)
+
+---
+
+## Notes
+
+- This project is intentionally standalone: no Redis, no Celery, no managed queue.
+- Job/event metadata persists locally in `backend/data/app.db`.
+- Stage/setup validation is stricter than legacy UI input handling.
+
+---
 
 ## License
-This project is licensed under the MIT License.
 
----
-
-If you want me to try a different approach to automate this update, let me know!
+MIT

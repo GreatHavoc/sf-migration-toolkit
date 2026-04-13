@@ -1,0 +1,10 @@
+# Backend API server dependencies
+# Install with: uv pip install -r backend/requirements.txt
+
+fastapi>=0.135.3
+uvicorn[standard]>=0.44.0
+pydantic>=2.12.5
+
+# Shared runtime dependencies
+snowflake-connector-python>=4.4.0
+sqlglot>=30.4.2

@@ -2,3 +2,20 @@
 sf_backup/
 __pycache__/
 *.pyc
+.venv/
+
+# Backend runtime artifacts
+backend/data/*
+!backend/data/.gitkeep
+backend/runtime/*
+!backend/runtime/.gitkeep
+checkpoint_*.json
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+.pnpm-store/
+frontend/AGENTS.md
+frontend/CLAUDE.md
+AGENT.md

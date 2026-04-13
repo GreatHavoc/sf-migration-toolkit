@@ -1,0 +1,28 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      SNOWFLAKE_MIGRATOR_DATA_DIR: /app/backend/data
+      PYTHONPATH: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/backend/data
+      - ./backend/runtime:/app/runtime
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped

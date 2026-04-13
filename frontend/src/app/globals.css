@@ -1,0 +1,179 @@
+:root {
+  --canvas: #f2f6f3;
+  --ink: #16222b;
+  --ink-soft: #45606d;
+  --frost: rgba(255, 255, 255, 0.82);
+  --frost-border: rgba(255, 255, 255, 0.88);
+  --accent: #1f8a70;
+  --accent-strong: #0f6b59;
+  --mono-font: var(--font-ibm-plex-mono);
+  --body-font: var(--font-sora);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 10% 5%, rgba(90, 180, 154, 0.25), transparent 35%),
+    radial-gradient(circle at 80% 8%, rgba(252, 191, 115, 0.28), transparent 38%),
+    linear-gradient(180deg, #ebf3ef 0%, var(--canvas) 45%, #f7faf8 100%);
+  font-family: var(--body-font), "Trebuchet MS", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.workbench-root {
+  min-height: 100vh;
+  position: relative;
+  overflow-x: hidden;
+}
+
+.ambient-orb {
+  position: fixed;
+  width: 300px;
+  height: 300px;
+  border-radius: 999px;
+  filter: blur(80px);
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  animation: fade-rise 700ms ease forwards;
+}
+
+.ambient-orb-left {
+  background: rgba(31, 138, 112, 0.3);
+  left: -80px;
+  top: 200px;
+}
+
+.ambient-orb-right {
+  background: rgba(231, 142, 53, 0.25);
+  right: -70px;
+  top: 120px;
+}
+
+.dashboard-shell {
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: 24px 16px 38px;
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+
+.hero-panel {
+  background: linear-gradient(138deg, rgba(255, 255, 255, 0.92), rgba(235, 250, 245, 0.78));
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  border-radius: 22px;
+  box-shadow: 0 18px 42px rgba(25, 49, 55, 0.09);
+  margin-bottom: 16px;
+  animation: rise-in 500ms ease both;
+}
+
+.hero-kicker {
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 11px;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.hero-title {
+  margin: 2px 0 0 !important;
+}
+
+.hero-subtitle {
+  margin-bottom: 8px;
+  color: var(--ink-soft);
+  max-width: 75ch;
+}
+
+.hero-meta .ant-tag {
+  border-radius: 999px;
+  padding-inline: 10px;
+}
+
+.section-tabs {
+  border-radius: 20px;
+  background: transparent;
+  animation: rise-in 650ms ease both;
+}
+
+.workflow-card {
+  margin-bottom: 16px;
+}
+
+.workflow-title {
+  display: inline-block;
+  margin-bottom: 10px;
+}
+
+.frost-card {
+  border-radius: 18px;
+  background: var(--frost) !important;
+  border: 1px solid var(--frost-border) !important;
+  box-shadow: 0 12px 32px rgba(26, 48, 55, 0.07);
+  backdrop-filter: blur(6px);
+}
+
+.mono-text {
+  font-family: var(--mono-font), "Consolas", "Courier New", monospace;
+  letter-spacing: 0.01em;
+}
+
+.field-label {
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #355362;
+}
+
+.phase-list .phase-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.phase-line-label {
+  max-width: 66%;
+}
+
+.history-list .ant-list-item {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+@keyframes rise-in {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-rise {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 992px) {
+  .dashboard-shell {
+    padding: 16px 12px 30px;
+  }
+
+  .hero-subtitle {
+    max-width: 100%;
+  }
+}

@@ -11,16 +11,16 @@ Migration Phases (execution order):
 7. DYNAMIC_TABLES - Migrate dynamic tables
 8. MATERIALIZED_VIEWS - Migrate materialized views
 9. VIEWS - Migrate regular views (topo-first + retry)
-10. CORTEX_SEARCH - Migrate cortex search services
-11. FUNCTIONS - Migrate functions
-12. PROCEDURES - Migrate procedures
-13. STREAMS - Migrate streams
-14. POLICIES - Migrate policies
-15. TASKS - Migrate tasks
-16. PIPES - Migrate pipes
-17. ALERTS - Migrate alerts
-18. SEMANTIC_VIEWS - Migrate semantic views
-19. STREAMLITS - Migrate Streamlit apps
+10. STAGES - Migrate named stages
+11. CORTEX_SEARCH - Migrate cortex search services
+12. FUNCTIONS - Migrate functions
+13. PROCEDURES - Migrate procedures
+14. STREAMS - Migrate streams
+15. POLICIES - Migrate policies
+16. TASKS - Migrate tasks
+17. PIPES - Migrate pipes
+18. ALERTS - Migrate alerts
+19. SEMANTIC_VIEWS - Migrate semantic views
 20. AGENTS - Migrate AI agents
 """
 
@@ -42,6 +42,12 @@ from .tables import migrate_table_ddls, migrate_table_data_ordered
 from .views import migrate_semantic_views, migrate_materialized_views
 from .procedures import migrate_functions, migrate_procedures
 from .policies import migrate_tags, migrate_policies
+from .apps import (
+    migrate_sequences,
+    migrate_file_formats,
+    migrate_notebooks,
+    migrate_agents,
+)
 from .tasks import (
     migrate_streams,
     migrate_tasks,
@@ -49,12 +55,7 @@ from .tasks import (
     migrate_dynamic_tables,
     migrate_pipes,
 )
-from .apps import (
-    migrate_streamlits,
-    migrate_agents,
-    migrate_sequences,
-    migrate_file_formats,
-)
+from .stages import migrate_stages
 from .cortex import migrate_cortex_search_services
 
 
@@ -111,6 +112,7 @@ def migrate_all_objects(
             "DYNAMIC_TABLES",  # Before VIEWS - views may reference DTs
             "MATERIALIZED_VIEWS",  # Before VIEWS when views depend on MVs
             "VIEWS",
+            "STAGES",  # After VIEWS - stage can reference views/files
             "CORTEX_SEARCH",  # After VIEWS - depends on tables/views
             "FUNCTIONS",
             "PROCEDURES",
@@ -120,7 +122,6 @@ def migrate_all_objects(
             "PIPES",
             "ALERTS",
             "SEMANTIC_VIEWS",
-            "STREAMLITS",
             "AGENTS",
         ]
 
@@ -280,6 +281,7 @@ def migrate_all_objects(
                 stage_ref,
                 run_id,
                 dry_run,
+                tgt_query_wh,
             )
             if result["errors"]:
                 log_phase("TABLE_DATA", data_count, result["errors"][0])
@@ -428,7 +430,23 @@ def migrate_all_objects(
             log_phase("VIEWS", 0, str(e))
             results["warnings"].append(f"View migration had issues: {e}")
 
-    # Phase 10: CORTEX SEARCH SERVICES
+    # Phase 10: STAGES
+    if should_run("STAGES"):
+        stage_count = 0
+        for schema in ordered_schemas:
+            if schema_done("STAGES", schema):
+                continue
+            result = migrate_stages(
+                src_conn, tgt_conn, src_db, schema, tgt_db, schema, dry_run, rewrite_db
+            )
+            results["total_migrated"] += result["migrated"]
+            stage_count += result["migrated"]
+            if result["errors"]:
+                results["errors"].extend(result["errors"])
+            mark_schema_done("STAGES", schema)
+        log_phase("STAGES", stage_count)
+
+    # Phase 11: CORTEX SEARCH SERVICES
     if should_run("CORTEX_SEARCH"):
         cs_count = 0
         for schema in ordered_schemas:
@@ -581,31 +599,7 @@ def migrate_all_objects(
             mark_schema_done("SEMANTIC_VIEWS", schema)
         log_phase("SEMANTIC_VIEWS", sv_count)
 
-    # Phase 18-19: APPS (Streamlit, Agents)
-    if should_run("STREAMLITS"):
-        st_count = 0
-        for schema in ordered_schemas:
-            if schema_done("STREAMLITS", schema):
-                continue
-            result = migrate_streamlits(
-                src_conn,
-                tgt_conn,
-                src_db,
-                schema,
-                tgt_db,
-                schema,
-                dry_run,
-                rewrite_db,
-                init_streamlit_live,
-            )
-            if result["errors"]:
-                log_phase("STREAMLITS", 0, result["errors"][0])
-                raise Exception(f"Streamlits failed: {result['errors'][0]}")
-            results["total_migrated"] += result["migrated"]
-            st_count += result["migrated"]
-            mark_schema_done("STREAMLITS", schema)
-        log_phase("STREAMLITS", st_count)
-
+    # Phase 19: AGENTS
     if should_run("AGENTS"):
         ag_count = 0
         for schema in ordered_schemas:

@@ -7,6 +7,7 @@ MIGRATION_PHASES = [
     "TAGS",
     "TABLE_DDLS",
     "TABLE_DATA",
+    "STAGES",
     "DYNAMIC_TABLES",
     "MATERIALIZED_VIEWS",
     "VIEWS",
@@ -19,7 +20,6 @@ MIGRATION_PHASES = [
     "PIPES",
     "ALERTS",
     "SEMANTIC_VIEWS",
-    "STREAMLITS",
     "AGENTS",
 ]
 

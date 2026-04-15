@@ -8,6 +8,7 @@ export const MIGRATION_PHASES = [
   "DYNAMIC_TABLES",
   "MATERIALIZED_VIEWS",
   "VIEWS",
+  "STAGES",
   "CORTEX_SEARCH",
   "FUNCTIONS",
   "PROCEDURES",
@@ -17,7 +18,6 @@ export const MIGRATION_PHASES = [
   "PIPES",
   "ALERTS",
   "SEMANTIC_VIEWS",
-  "STREAMLITS",
   "AGENTS",
 ] as const;
 

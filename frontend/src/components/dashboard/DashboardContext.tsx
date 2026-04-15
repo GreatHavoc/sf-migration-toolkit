@@ -159,8 +159,17 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       if (cachedTarget) {
         setTargetConnection((prev) => ({ ...prev, ...JSON.parse(cachedTarget) }));
       }
+      
+      const cachedNamespace = localStorage.getItem("mig_namespace");
+      const cachedStage = localStorage.getItem("mig_stage");
+      if (cachedNamespace) {
+        setNamespace((prev) => ({ ...prev, ...JSON.parse(cachedNamespace) }));
+      }
+      if (cachedStage) {
+        setStage((prev) => ({ ...prev, ...JSON.parse(cachedStage) }));
+      }
     } catch (e) {
-      console.warn("Failed to load cached connections", e);
+      console.warn("Failed to load cached connections or settings", e);
     }
   }, []);
 
@@ -171,6 +180,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("mig_source_connection", JSON.stringify(safeSource));
     localStorage.setItem("mig_target_connection", JSON.stringify(safeTarget));
   }, [sourceConnection, targetConnection]);
+
   const [sourceValidated, setSourceValidated] = useState(false);
   const [targetValidated, setTargetValidated] = useState(false);
   const [sourceDatabases, setSourceDatabases] = useState<string[]>([]);
@@ -179,6 +189,14 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   const [namespace, setNamespace] = useState<NamespaceConfig>(EMPTY_NAMESPACE);
   const [stage, setStage] = useState<StageState>(EMPTY_STAGE);
+
+  useEffect(() => {
+    localStorage.setItem("mig_namespace", JSON.stringify(namespace));
+  }, [namespace]);
+
+  useEffect(() => {
+    localStorage.setItem("mig_stage", JSON.stringify(stage));
+  }, [stage]);
 
   const [sourceDb, setSourceDb] = useState("");
   const [targetDb, setTargetDb] = useState("");
@@ -210,15 +228,24 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         ]);
         if (!alive) return;
         setDefaults(defaultsResponse);
-        setNamespace({
-          mig_db: defaultsResponse.mig_db,
-          mig_schema: defaultsResponse.mig_schema,
-          stage_name: defaultsResponse.stage_name,
+        
+        // Only set defaults if we didn't load from cache
+        setNamespace((prev) => {
+          if (prev.mig_db !== EMPTY_NAMESPACE.mig_db) return prev;
+          return {
+            ...prev,
+            mig_db: defaultsResponse.mig_db,
+            mig_schema: defaultsResponse.mig_schema,
+            stage_name: defaultsResponse.stage_name,
+          };
         });
-        setStage((prev) => ({
-          ...prev,
-          integration_name: defaultsResponse.integration_name,
-        }));
+        setStage((prev) => {
+          if (prev.integration_name !== EMPTY_STAGE.integration_name) return prev;
+          return {
+            ...prev,
+            integration_name: defaultsResponse.integration_name,
+          };
+        });
         setHistory(historyResponse.jobs);
       } catch (error) {
         if (alive) {
@@ -287,17 +314,24 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   async function handleTestBoth() {
     await runBusy("test-both", async () => {
+      // First test the connections to establish session and validate credentials
       await Promise.all([
-        testConnection(sourceConnection).then(() => setSourceValidated(true)),
-        testConnection(targetConnection).then(() => setTargetValidated(true)),
+        testConnection(sourceConnection),
+        testConnection(targetConnection),
       ]);
+      
+      // Then fetch databases
       const [srcDbs, tgtDbs] = await Promise.all([
         listDatabases(sourceConnection),
         listDatabases(targetConnection)
       ]);
+      
+      // Only set validated if EVERYTHING succeeded
       setSourceDatabases(srcDbs.databases);
       setTargetDatabases(tgtDbs.databases);
-      message.success("Both connections look good.");
+      setSourceValidated(true);
+      setTargetValidated(true);
+      message.success("Both connections look good and databases loaded.");
     });
   }
 
@@ -310,6 +344,9 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }
 
   async function handleSourceDbChange(val: string) {
+    if (!targetDb || targetDb === sourceDb) {
+      setTargetDb(val);
+    }
     setSourceDb(val);
     setSchemaInput([]); // Reset selected schemas when DB changes
     if (val && sourceValidated) {
@@ -329,6 +366,9 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       requireConnections();
       if (!sourceDb.trim() || !targetDb.trim()) {
         throw new Error("Source and Target DBs are required for precheck.");
+      }
+      if (!stage.azure_tenant_id.trim() || !stage.storage_account.trim() || !stage.container.trim()) {
+        throw new Error("Azure Tenant ID, Storage Account, and Container are required for stage setup.");
       }
 
       const stagePayload = getStagePayload();

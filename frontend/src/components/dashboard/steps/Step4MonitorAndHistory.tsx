@@ -1,6 +1,6 @@
 "use client";
 
-import { Button, Card, Col, Descriptions, Divider, Empty, List, Row, Space, Tag, Timeline, Typography, Progress } from "antd";
+import { Button, Card, Col, Descriptions, Divider, Empty, Row, Space, Tag, Timeline, Typography, Progress, Tabs } from "antd";
 import { ReloadOutlined } from "@ant-design/icons";
 import { useDashboard } from "../DashboardContext";
 
@@ -80,61 +80,78 @@ export default function Step4MonitorAndHistory() {
                   </Descriptions.Item>
                 </Descriptions>
 
-                <Divider />
-                <Space orientation="vertical" style={{ width: "100%" }}>
-                  <Text strong>Overall Progress</Text>
-                  <Progress 
-                    percent={progressPercent} 
-                    status={progressStatus} 
-                    strokeColor={{ '0%': '#108ee9', '100%': '#87d068' }}
-                  />
-                  {inProgressPhase && <Text type="secondary">Currently working on: <Text strong>{inProgressPhase}</Text></Text>}
-                </Space>
-
-                <Divider />
-                <Text strong>Phase Progress</Text>
-                <List
-                  className="phase-list"
-                  size="small"
-                  dataSource={selectedPhases}
-                  renderItem={(phase) => {
-                    const status = phaseStatus.get(phase) || { status: "pending", count: 0 };
-                    return (
-                      <List.Item className="phase-line">
-                        <Space className="phase-line-label">
-                          <Text className="mono-text">{phase}</Text>
-                        </Space>
-                        <Space>
-                          <Tag color={phaseColor(status.status)}>{status.status.toUpperCase()}</Tag>
-                          <Text type="secondary">objects: {status.count}</Text>
-                        </Space>
-                      </List.Item>
-                    );
-                  }}
-                />
-
-                <Divider />
-                {events.length > 0 ? (
-                  <Timeline
-                    items={events
-                      .slice(-25)
-                      .reverse()
-                      .map((event) => ({
-                        color: timelineColor(event.event_type),
-                        children: (
-                          <Space orientation="vertical" size={0}>
-                            <Text strong>{event.event_type}</Text>
-                            <Text>{event.message}</Text>
-                            <Text type="secondary" className="mono-text">
-                              {new Date(event.created_at).toLocaleString()}
-                            </Text>
+                <Tabs 
+                  defaultActiveKey="1" 
+                  style={{ marginTop: 16 }}
+                  items={[
+                    {
+                      key: "1",
+                      label: "Progress & Phases",
+                      children: (
+                        <>
+                          <Space orientation="vertical" style={{ width: "100%", marginBottom: 16 }}>
+                            <Text strong>Overall Progress</Text>
+                            <Progress 
+                              percent={progressPercent} 
+                              status={progressStatus} 
+                              strokeColor={{ '0%': '#108ee9', '100%': '#87d068' }}
+                            />
+                            {inProgressPhase && <Text type="secondary">Currently working on: <Text strong>{inProgressPhase}</Text></Text>}
                           </Space>
-                        ),
-                      }))}
-                  />
-                ) : (
-                  <Empty description="No events yet. Start or select a run." />
-                )}
+                          
+                          <Text strong>Phase Progress</Text>
+                          <div style={{ maxHeight: 300, overflowY: "auto", paddingRight: 8, marginTop: 12 }}>
+                            <Space orientation="vertical" style={{ width: '100%' }}>
+                              {selectedPhases.map((phase) => {
+                                const status = phaseStatus.get(phase) || { status: "pending", count: 0 };
+                                return (
+                                  <div key={phase} className="phase-line" style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #f0f0f0' }}>
+                                    <Space className="phase-line-label">
+                                      <Text className="mono-text">{phase}</Text>
+                                    </Space>
+                                    <Space>
+                                      <Tag color={phaseColor(status.status)}>{status.status.toUpperCase()}</Tag>
+                                      <Text type="secondary">objects: {status.count}</Text>
+                                    </Space>
+                                  </div>
+                                );
+                              })}
+                            </Space>
+                          </div>
+                        </>
+                      )
+                    },
+                    {
+                      key: "2",
+                      label: "Event Timeline",
+                      children: (
+                        <div style={{ maxHeight: 400, overflowY: "auto", paddingRight: 16, paddingTop: 8 }}>
+                          {events.length > 0 ? (
+                            <Timeline
+                              items={events
+                                .slice(-25)
+                                .reverse()
+                                .map((event) => ({
+                                  color: timelineColor(event.event_type),
+                                  content: (
+                                    <Space orientation="vertical" size={0}>
+                                      <Text strong>{event.event_type}</Text>
+                                      <Text>{event.message}</Text>
+                                      <Text type="secondary" className="mono-text">
+                                        {new Date(event.created_at).toLocaleString()}
+                                      </Text>
+                                    </Space>
+                                  ),
+                                }))}
+                            />
+                          ) : (
+                            <Empty description="No events yet. Start or select a run." />
+                          )}
+                        </div>
+                      )
+                    }
+                  ]}
+                />
               </>
             ) : (
               <Empty description="No active job. Launch a run or select one from history." />
@@ -160,46 +177,41 @@ export default function Step4MonitorAndHistory() {
             {history.length === 0 ? (
               <Empty description="No runs recorded in local SQLite yet." />
             ) : (
-              <List
-                className="history-list"
-                itemLayout="horizontal"
-                dataSource={history}
-                renderItem={(item) => (
-                  <List.Item
-                    actions={[
-                      <Button
-                        key={`open-${item.job_id}`}
-                        type={activeJobId === item.job_id ? "primary" : "default"}
-                        onClick={async () => {
-                          setEvents([]);
-                          await refreshJob(item.job_id);
-                          connectJobStream(item.job_id, 0);
-                        }}
-                      >
-                        Open
-                      </Button>,
-                    ]}
-                  >
-                    <List.Item.Meta
-                      title={
-                        <Space wrap>
+              <div style={{ maxHeight: 600, overflowY: "auto", paddingRight: 8 }}>
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  {history.map((item) => (
+                    <div key={item.job_id} style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', borderBottom: '1px solid #f0f0f0' }}>
+                      <div style={{ flex: 1 }}>
+                        <Space wrap style={{ marginBottom: 4 }}>
                           <Text className="mono-text">{item.run_id}</Text>
                           <Tag color={statusColor(item.status)}>{item.status.toUpperCase()}</Tag>
                         </Space>
-                      }
-                      description={
-                        <Space wrap>
-                          <Text>{item.source_db}</Text>
-                          <Text type="secondary">to</Text>
-                          <Text>{item.target_db}</Text>
-                          <Tag>{item.dry_run ? "Dry Run" : "Live Run"}</Tag>
-                          <Text type="secondary">{new Date(item.created_at).toLocaleString()}</Text>
-                        </Space>
-                      }
-                    />
-                  </List.Item>
-                )}
-              />
+                        <div>
+                          <Space wrap>
+                            <Text>{item.source_db}</Text>
+                            <Text type="secondary">to</Text>
+                            <Text>{item.target_db}</Text>
+                            <Tag>{item.dry_run ? "Dry Run" : "Live Run"}</Tag>
+                            <Text type="secondary">{new Date(item.created_at).toLocaleString()}</Text>
+                          </Space>
+                        </div>
+                      </div>
+                      <div>
+                        <Button
+                          type={activeJobId === item.job_id ? "primary" : "default"}
+                          onClick={async () => {
+                            setEvents([]);
+                            await refreshJob(item.job_id);
+                            connectJobStream(item.job_id, 0);
+                          }}
+                        >
+                          Open
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </Space>
+              </div>
             )}
           </Card>
         </Col>

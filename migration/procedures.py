@@ -1,4 +1,7 @@
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 from connection import exec_sql
 from discovery import (
     list_functions,
@@ -72,6 +75,7 @@ def migrate_procedures(
 ) -> dict:
     """Migrate stored procedures from source to target."""
     procs = list_procedures(src_conn, src_db, schema)
+    logger.info(f"Found {len(procs)} procedures in {src_db}.{schema}")
     if not procs:
         return {"migrated": 0, "errors": []}
 
@@ -80,15 +84,22 @@ def migrate_procedures(
     skipped = []
 
     for proc in procs:
+        logger.info(f"Processing procedure: {proc}")
         meta = get_procedure_ddl(src_conn, src_db, schema, proc)
         # meta is a dict: {'ddl','is_system','signature','error'}
-        if not meta or meta.get("is_system"):
+        if not meta:
+            skipped.append(f"{proc}: Could not get metadata")
+            logger.warning(f"Skip {proc}: No metadata returned")
+            continue
+        if meta.get("is_system"):
             skipped.append(f"{proc}: System or unmanaged procedure (skipped)")
+            logger.info(f"Skip {proc}: Is system object")
             continue
 
         ddl = meta.get("ddl")
         if not ddl:
             skipped.append(f"{proc}: Could not get DDL ({meta.get('error')})")
+            logger.warning(f"Skip {proc}: No DDL - {meta.get('error')}")
             continue
 
         if tgt_db != src_db:
@@ -98,12 +109,17 @@ def migrate_procedures(
             try:
                 exec_sql(tgt_conn, ddl)
                 migrated += 1
+                logger.info(f"Migrated procedure: {proc}")
             except Exception as e:
                 errors.append(f"{proc}: {str(e)}")
+                logger.error(f"Error migrating {proc}: {e}")
         else:
             migrated += 1
 
     out = {"migrated": migrated, "errors": errors}
     if skipped:
         out["skipped"] = skipped
+    logger.info(
+        f"Procedure migration result: {migrated} migrated, {len(errors)} errors, {len(skipped)} skipped"
+    )
     return out

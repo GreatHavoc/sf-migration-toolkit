@@ -2,6 +2,9 @@ import os
 import re
 import tempfile
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 from connection import exec_sql, exec_script
 from discovery import (
     list_streamlits,
@@ -31,13 +34,16 @@ def migrate_streamlits(
 ):
     """Migrate Streamlit apps."""
     apps = list_streamlits(src_conn, src_db, src_schema)
+    logger.info(f"Found {len(apps)} Streamlit apps in {src_db}.{src_schema}")
     errors = []
     migrated = 0
 
     for app in apps:
+        logger.info(f"Processing Streamlit: {app}")
         ddl = get_streamlit_ddl(src_conn, src_db, src_schema, app)
         if not ddl:
             errors.append(f"{app}: Could not get DDL")
+            logger.warning(f"Skip {app}: No DDL")
             continue
         if rewrite_db and tgt_db != src_db:
             ddl = rewrite_db_in_ddl(ddl, src_db, tgt_db)
@@ -51,11 +57,16 @@ def migrate_streamlits(
                         f"ALTER STREAMLIT {tgt_db}.{tgt_schema}.{app} ADD LIVE VERSION FROM LAST",
                     )
                 migrated += 1
+                logger.info(f"Migrated Streamlit: {app}")
             except Exception as e:
                 errors.append(f"{app}: {str(e)}")
+                logger.error(f"Error migrating Streamlit {app}: {e}")
         else:
             migrated += 1
 
+    logger.info(
+        f"Streamlit migration result: {migrated} migrated, {len(errors)} errors"
+    )
     return {"migrated": migrated, "errors": errors}
 
 

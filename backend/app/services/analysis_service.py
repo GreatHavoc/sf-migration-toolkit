@@ -13,11 +13,12 @@ def resolve_schemas(
     conn, source_db: str, requested_schemas: list[str] | None
 ) -> list[str]:
     available = get_all_schemas(conn, source_db)
-    if requested_schemas:
-        requested_upper = {s.upper() for s in requested_schemas}
-        filtered = [s for s in available if s.upper() in requested_upper]
-        return filtered
-    return available
+    # Empty array or None means "migrate ALL schemas"
+    if not requested_schemas:
+        return available
+    requested_upper = {s.upper() for s in requested_schemas}
+    filtered = [s for s in available if s.upper() in requested_upper]
+    return filtered
 
 
 def run_precheck(conn, source_db: str, schemas: list[str]) -> dict:

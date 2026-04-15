@@ -242,6 +242,8 @@ export function openMigrationStream(
     } catch {
       handlers.onError?.(new Error("Failed to parse stream end payload"));
     }
+    // Close the stream intentionally to prevent EventSource from auto-reconnecting and firing onerror
+    source.close();
   };
   source.addEventListener("stream.ended", streamEndedListener);
   listeners.push({ type: "stream.ended", listener: streamEndedListener });

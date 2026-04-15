@@ -1,5 +1,8 @@
 from connection import exec_sql
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+logger = logging.getLogger(__name__)
 
 from discovery import (
     list_views,
@@ -103,10 +106,10 @@ def _extract_fqns_from_sql(
     try:
         parsed = sqlglot.parse_one(sql, read="snowflake")
     except ParseError as e:
-        print(f"[PARSE ERROR] Could not parse SQL for dependency extraction: {e}")
+        logger.warning(f"Could not parse SQL for dependency extraction: {e}")
         return []
     except Exception as e:
-        print(f"[PARSE FAIL] Unexpected parse error: {e}")
+        logger.warning(f"Unexpected parse error: {e}")
         return []
 
     def normalize_ident(ident):
@@ -299,6 +302,16 @@ def clear_dependency_cache():
     _deps_cache.clear()
 
 
+INTERNAL_DATABASES = {
+    "SNOWFLAKE",
+    "SNOWFLAKE_SAMPLE_DATA",
+    "SNOWFLAKE_DB",
+    "UTIL_DB",
+    "ACCOUNT_USAGE",
+    "READER_ACCOUNT_USAGE",
+}
+
+
 def validate_cross_db_dependencies(conn, db, schemas):
     """
     Validate if there are cross-database dependencies for any objects in the given schemas.
@@ -311,8 +324,12 @@ def validate_cross_db_dependencies(conn, db, schemas):
         for dep in deps_result.get("dependencies", []):
             depends_on_db = dep["depends_on"].get("database", "")
             referencing_db = dep["referencing"].get("database", "")
-            # Only care if the referencing DB is `db` (current), but depends_on_db is not
             if depends_on_db and depends_on_db != db:
+                if depends_on_db.upper() in INTERNAL_DATABASES:
+                    warnings.append(
+                        f"Object {referencing_db}.{dep['referencing']['schema']}.{dep['referencing']['name']} references internal object {depends_on_db}.{dep['depends_on']['schema']}.{dep['depends_on']['name']} (ignored)"
+                    )
+                    continue
                 obj = dep["referencing"]
                 target = dep["depends_on"]
                 errors.append(

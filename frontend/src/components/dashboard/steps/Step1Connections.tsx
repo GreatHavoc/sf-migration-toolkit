@@ -162,7 +162,7 @@ export default function Step1Connections() {
       {localShowErrors && (
         <Alert
           type="error"
-          message="Validation Error"
+          title="Validation Error"
           description="Please fill in all required fields (Account, User, Password) for both connections."
           showIcon
         />

@@ -1,13 +1,13 @@
 "use client";
 
-import { Alert, Button, Card, Col, Descriptions, Divider, Input, List, Row, Select, Space, Typography } from "antd";
+import { Alert, Button, Card, Col, Descriptions, Divider, Input, Row, Select, Space, Typography } from "antd";
 import { ExperimentOutlined, ApiOutlined, BranchesOutlined } from "@ant-design/icons";
 import { useDashboard } from "../DashboardContext";
 import { LabeledInput } from "./Step1Connections";
 
 const { Text } = Typography;
 
-export function LabeledSelect({
+export function LabeledSelect<T extends string | string[]>({
   label,
   value,
   onChange,
@@ -16,8 +16,8 @@ export function LabeledSelect({
   mode,
 }: {
   label: string;
-  value: string | string[];
-  onChange: (val: any) => void;
+  value: T;
+  onChange: (val: T) => void;
   options: string[];
   placeholder?: string;
   mode?: "multiple" | "tags";
@@ -108,7 +108,7 @@ export default function Step2SetupAndAnalysis() {
             <LabeledSelect label="Source DB" value={sourceDb} onChange={setSourceDb} options={sourceDatabases} placeholder="Select Source DB" />
           </Col>
           <Col xs={24} md={12}>
-            <LabeledSelect label="Target DB" value={targetDb} onChange={setTargetDb} options={targetDatabases} placeholder="Select Target DB" />
+            <LabeledInput label="Target DB Name" value={targetDb} onChange={setTargetDb} placeholder="Defaults to Source DB name" />
           </Col>
           <Col xs={24}>
             <LabeledSelect 
@@ -166,15 +166,13 @@ export default function Step2SetupAndAnalysis() {
           {stageListRows.length > 0 && (
             <>
               {stageInspectData && <Divider />}
-              <List
-                size="small"
-                dataSource={stageListRows.slice(0, 25)}
-                renderItem={(row, idx) => (
-                  <List.Item>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                {stageListRows.slice(0, 25).map((row, idx) => (
+                  <div key={idx} style={{ padding: '8px 0', borderBottom: '1px solid #f0f0f0' }}>
                     <Text className="mono-text">{`${idx + 1}. ${row.join(" | ")}`}</Text>
-                  </List.Item>
-                )}
-              />
+                  </div>
+                ))}
+              </Space>
             </>
           )}
         </Card>

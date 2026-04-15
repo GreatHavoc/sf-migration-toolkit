@@ -125,9 +125,19 @@ class JobRunner:
 
             selected_phases = request.get("selected_phases") or MIGRATION_PHASES
 
+            # Strip passcode from connection payloads before worker connects.
+            # The UI's earlier authentication persists the MFA token in OS keyring.
+            # A fresh connection without passcode will use that cached token.
+            src_creds = {
+                k: v for k, v in request["source_connection"].items() if k != "passcode"
+            }
+            tgt_creds = {
+                k: v for k, v in request["target_connection"].items() if k != "passcode"
+            }
+
             with (
-                snowflake_connection(_Obj(request["source_connection"])) as src_conn,
-                snowflake_connection(_Obj(request["target_connection"])) as tgt_conn,
+                snowflake_connection(_Obj(src_creds)) as src_conn,
+                snowflake_connection(_Obj(tgt_creds)) as tgt_conn,
             ):
                 resolved_schemas = resolve_schemas(
                     src_conn,

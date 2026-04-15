@@ -15,6 +15,9 @@ def connect_sf(account, user, password, role=None, warehouse=None, passcode=None
         kwargs["warehouse"] = warehouse
     if passcode:
         kwargs["passcode"] = passcode
+    # Tell the connector to persist the MFA token in the OS credential cache
+    kwargs["authenticator"] = "username_password_mfa"
+    kwargs["client_store_temporary_credential"] = True
     return snowflake.connector.connect(**kwargs)
 
 

@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..constants import MIGRATION_PHASES
@@ -145,18 +145,28 @@ def resume_migration(job_id: str) -> JobActionResponse:
 
 @router.get("/{job_id}/events")
 def stream_migration_events(
+    request: Request,
     job_id: str,
     after_event_id: int = Query(default=0, ge=0),
 ) -> StreamingResponse:
+    last_event_id_header = request.headers.get("last-event-id")
+    if last_event_id_header and last_event_id_header.isdigit():
+        after_event_id = int(last_event_id_header)
+
     try:
         job = get_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    def event_generator():
+    async def event_generator():
+        import asyncio
+
         last_id = after_event_id
         while True:
-            events = get_events(job_id, after_event_id=last_id, limit=200)
+            # Run the synchronous get_events in a thread to not block the event loop
+            events = await asyncio.to_thread(
+                get_events, job_id, after_event_id=last_id, limit=200
+            )
             for raw in events:
                 event = MigrationEvent(
                     event_id=raw["event_id"],
@@ -174,7 +184,7 @@ def stream_migration_events(
                 yield f"event: {event.event_type}\n"
                 yield f"data: {event.model_dump_json()}\n\n"
 
-            current = get_job(job_id)
+            current = await asyncio.to_thread(get_job, job_id)
             if current.status in {"succeeded", "failed", "cancelled"} and not events:
                 terminal_payload = {
                     "job_id": current.job_id,
@@ -187,7 +197,7 @@ def stream_migration_events(
 
             yield "event: stream.ping\n"
             yield f"data: {json.dumps({'job_id': job.job_id, 'last_event_id': last_id})}\n\n"
-            time.sleep(1)
+            await asyncio.sleep(1)
 
     headers = {
         "Cache-Control": "no-cache",

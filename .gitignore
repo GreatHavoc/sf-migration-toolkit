@@ -19,3 +19,5 @@ frontend/out/
 frontend/AGENTS.md
 frontend/CLAUDE.md
 AGENT.md
+__pycache__/connection.cpython-313.pyc
+__pycache__/dependencies.cpython-313.pyc

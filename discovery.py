@@ -1,3 +1,19 @@
+import logging
+import sys
+
+logger = (
+    logging.logger(__name__)
+    if hasattr(logging, "logger")
+    else logging.getLogger(__name__)
+)
+
+
+def log_debug(msg):
+    """Log to both logger and stdout for debugging"""
+    print(f"[DEBUG] {msg}", file=sys.stderr)
+    logger.info(msg)
+
+
 from typing import Optional
 import json
 import ast
@@ -26,6 +42,7 @@ def inventory_all_objects(conn, db: str, schema: str) -> dict:
         "tables": [],
         "views": [],
         "materialized_views": [],
+        "semantic_views": [],
         "sequences": [],
         "file_formats": [],
         "stages": [],
@@ -47,104 +64,148 @@ def inventory_all_objects(conn, db: str, schema: str) -> dict:
     try:
         tables = exec_sql(conn, f"SHOW TABLES IN SCHEMA {fq(db, schema)}")
         inventory["tables"] = [r[1] for r in tables if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         views = exec_sql(conn, f"SHOW VIEWS IN SCHEMA {fq(db, schema)}")
         inventory["views"] = [r[1] for r in views if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         mvs = exec_sql(conn, f"SHOW MATERIALIZED VIEWS IN SCHEMA {fq(db, schema)}")
         inventory["materialized_views"] = [r[1] for r in mvs if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
+
+    try:
+        svs = exec_sql(conn, f"SHOW SEMANTIC VIEWS IN SCHEMA {fq(db, schema)}")
+        inventory["semantic_views"] = [r[1] for r in svs if len(r) > 1]
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         seqs = exec_sql(conn, f"SHOW SEQUENCES IN SCHEMA {fq(db, schema)}")
         inventory["sequences"] = [r[1] for r in seqs if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         ffs = exec_sql(conn, f"SHOW FILE FORMATS IN SCHEMA {fq(db, schema)}")
         inventory["file_formats"] = [r[1] for r in ffs if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         stages = exec_sql(conn, f"SHOW STAGES IN SCHEMA {fq(db, schema)}")
         inventory["stages"] = [r[1] for r in stages if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         streams = exec_sql(conn, f"SHOW STREAMS IN SCHEMA {fq(db, schema)}")
         inventory["streams"] = [r[1] for r in streams if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         pipes = exec_sql(conn, f"SHOW PIPES IN SCHEMA {fq(db, schema)}")
         inventory["pipes"] = [r[1] for r in pipes if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         task = exec_sql(conn, f"SHOW TASKS IN SCHEMA {fq(db, schema)}")
         inventory["tasks"] = [r[1] for r in task if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
-        procs = exec_sql(conn, f"SHOW PROCEDURES IN SCHEMA {fq(db, schema)}")
-        inventory["procedures"] = [r[1] for r in procs if len(r) > 1]
-    except:
-        pass
+        cols, procs = exec_sql_with_cols(
+            conn, f"SHOW PROCEDURES IN SCHEMA {fq(db, schema)}"
+        )
+        log_debug(f"SHOW PROCEDURES columns: {cols}")
+        log_debug(f"SHOW PROCEDURES total rows: {len(procs)}")
+        i_name = _find_col(cols, "name")
+        i_builtin = _find_col(cols, "is_builtin")
+        log_debug(f"Column indices: name={i_name}, is_builtin={i_builtin}")
+        if i_name is not None:
+            valid_procs = []
+            for r in procs:
+                if len(r) > i_name and r[i_name]:
+                    is_builtin = False
+                    if i_builtin is not None and len(r) > i_builtin:
+                        val = str(r[i_builtin]).upper() if r[i_builtin] else ""
+                        if val == "Y":
+                            is_builtin = True
+                        log_debug(f"  Proc: {r[i_name]}, is_builtin={val}")
+                    if not is_builtin:
+                        valid_procs.append(r[i_name])
+            log_debug(f"Found {len(valid_procs)} user procedures in {db}.{schema}")
+            log_debug(f"User procedure names: {valid_procs}")
+            inventory["procedures"] = valid_procs
+        else:
+            log_debug("Could not find 'name' column")
+    except Exception as e:
+        logger.warning(f"Ignored procedures exception: {e}")
 
     try:
-        funcs = exec_sql(conn, f"SHOW FUNCTIONS IN SCHEMA {fq(db, schema)}")
-        inventory["functions"] = [r[1] for r in funcs if len(r) > 1]
-    except:
-        pass
+        cols, funcs = exec_sql_with_cols(
+            conn, f"SHOW FUNCTIONS IN SCHEMA {fq(db, schema)}"
+        )
+        i_name = _find_col(cols, "name")
+        i_builtin = _find_col(cols, "is_builtin")
+        if i_name is not None:
+            valid_funcs = []
+            for r in funcs:
+                if len(r) > i_name and r[i_name]:
+                    if (
+                        i_builtin is not None
+                        and len(r) > i_builtin
+                        and str(r[i_builtin]).upper() == "Y"
+                    ):
+                        continue
+                    valid_funcs.append(r[i_name])
+            inventory["functions"] = valid_funcs
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         tags = exec_sql(conn, f"SHOW TAGS IN SCHEMA {fq(db, schema)}")
         inventory["tags"] = [r[1] for r in tags if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         mp = exec_sql(conn, f"SHOW MASKING POLICIES IN SCHEMA {fq(db, schema)}")
         inventory["masking_policies"] = [r[1] for r in mp if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         rap = exec_sql(conn, f"SHOW ROW ACCESS POLICIES IN SCHEMA {fq(db, schema)}")
         inventory["row_access_policies"] = [r[1] for r in rap if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         dt = exec_sql(conn, f"SHOW DYNAMIC TABLES IN SCHEMA {fq(db, schema)}")
         inventory["dynamic_tables"] = [r[1] for r in dt if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         alerts = exec_sql(conn, f"SHOW ALERTS IN SCHEMA {fq(db, schema)}")
         inventory["alerts"] = [r[1] for r in alerts if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         ext = exec_sql(conn, f"SHOW EXTERNAL TABLES IN SCHEMA {fq(db, schema)}")
         inventory["external_tables"] = [r[1] for r in ext if len(r) > 1]
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     try:
         cols, rows = exec_sql_with_cols(conn, "SHOW CORTEX SEARCH SERVICES")
@@ -163,8 +224,8 @@ def inventory_all_objects(conn, db: str, schema: str) -> dict:
                 ):
                     if r[i_name]:
                         inventory["cortex_search_services"].append(r[i_name])
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     total = sum(len(v) for v in inventory.values())
     inventory["_summary"] = {
@@ -281,7 +342,8 @@ def get_task_predecessor_map(conn, db: str, schema: str) -> dict[str, set[str]]:
     out: dict[str, set[str]] = {}
     try:
         cols, rows = exec_sql_with_cols(conn, f"SHOW TASKS IN SCHEMA {fq(db, schema)}")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         return out
 
     i_name = _find_col(cols, "name")
@@ -305,10 +367,12 @@ def get_task_predecessor_map(conn, db: str, schema: str) -> dict[str, set[str]]:
             s = preds_raw.strip()
             try:
                 parsed = json.loads(s)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Ignored exception: {e}")
                 try:
                     parsed = ast.literal_eval(s)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Ignored exception: {e}")
                     parsed = []
 
         if isinstance(parsed, list):
@@ -323,9 +387,25 @@ def get_task_predecessor_map(conn, db: str, schema: str) -> dict[str, set[str]]:
 def list_procedures(conn, db: str, schema: str) -> list[str]:
     cols, rows = exec_sql_with_cols(conn, f"SHOW PROCEDURES IN SCHEMA {fq(db, schema)}")
     i_name = _find_col(cols, "name")
+    i_builtin = _find_col(cols, "is_builtin")
+    i_signature = _find_col(cols, "signature")  # Also get signature for logging
+    logger.info(
+        f"SHOW PROCEDURES: name_idx={i_name}, builtin_idx={i_builtin}, sig_idx={i_signature}"
+    )
     if i_name is None:
         return []
-    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
+    valid = []
+    for r in rows:
+        if len(r) > i_name and r[i_name]:
+            is_b = False
+            if i_builtin is not None and len(r) > i_builtin:
+                val = str(r[i_builtin]).upper() if r[i_builtin] else ""
+                if val == "Y":
+                    is_b = True
+            if not is_b:
+                valid.append(r[i_name])
+    logger.info(f"User procedures found by list_procedures: {valid}")
+    return valid
 
 
 def get_procedure_ddl(conn, db: str, schema: str, name: str) -> dict:
@@ -340,6 +420,7 @@ def get_procedure_ddl(conn, db: str, schema: str, name: str) -> dict:
             conn, f"SHOW PROCEDURES IN SCHEMA {fq(db, schema)}"
         )
         i_name = _find_col(cols, "name")
+        i_builtin = _find_col(cols, "is_builtin")
         # signature/arguments column names vary across Snowflake versions
         i_sig = (
             _find_col(cols, "signature")
@@ -360,7 +441,8 @@ def get_procedure_ddl(conn, db: str, schema: str, name: str) -> dict:
                 continue
             try:
                 pname_str = str(pname).upper()
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Ignored exception: {e}")
                 pname_str = None
             if pname_str != target_name:
                 continue
@@ -374,16 +456,35 @@ def get_procedure_ddl(conn, db: str, schema: str, name: str) -> dict:
             if i_owner is not None and len(r) > i_owner and r[i_owner]:
                 owner = str(r[i_owner]).strip()
 
+            if (
+                i_builtin is not None
+                and len(r) > i_builtin
+                and str(r[i_builtin]).upper() == "Y"
+            ):
+                out["is_system"] = True
             # Heuristic: if owner/creator mentions SNOWFLAKE or system-like, mark as system
-            if owner and ("SNOWFLAKE" in owner.upper() or "SYSTEM" in owner.upper()):
+            elif owner and ("SNOWFLAKE" in owner.upper() or "SYSTEM" in owner.upper()):
                 out["is_system"] = True
 
-            ident = f"{db}.{schema}.{name}{sig}" if sig else f"{db}.{schema}.{name}"
+            # Format: GET_DDL('PROCEDURE', 'db.schema.name(arg1, arg2)')
+            if sig:
+                # Get just the arguments part inside parens
+                start = sig.find("(")
+                end = sig.rfind(")")
+                if start != -1 and end != -1 and start < end:
+                    args = sig[start + 1 : end]
+                    ident = f"{db}.{schema}.{name}({args})"
+                else:
+                    ident = f"{db}.{schema}.{name}"
+            else:
+                ident = f"{db}.{schema}.{name}"
+
             try:
                 out["ddl"] = fetch_one_val(
                     conn, "SELECT GET_DDL('PROCEDURE', %s, TRUE)", (ident,)
                 )
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Ignored exception: {e}")
                 # fallback: try without signature
                 try:
                     out["ddl"] = fetch_one_val(
@@ -417,9 +518,20 @@ def get_procedure_ddl(conn, db: str, schema: str, name: str) -> dict:
 def list_functions(conn, db: str, schema: str) -> list[str]:
     cols, rows = exec_sql_with_cols(conn, f"SHOW FUNCTIONS IN SCHEMA {fq(db, schema)}")
     i_name = _find_col(cols, "name")
+    i_builtin = _find_col(cols, "is_builtin")
     if i_name is None:
         return []
-    return [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
+    valid = []
+    for r in rows:
+        if len(r) > i_name and r[i_name]:
+            if (
+                i_builtin is not None
+                and len(r) > i_builtin
+                and str(r[i_builtin]).upper() == "Y"
+            ):
+                continue
+            valid.append(r[i_name])
+    return valid
 
 
 def get_function_ddl(conn, db: str, schema: str, name: str) -> dict:
@@ -459,7 +571,8 @@ def get_function_ddl(conn, db: str, schema: str, name: str) -> dict:
                     conn, "SELECT GET_DDL('FUNCTION', %s, TRUE)", (ident,)
                 )
                 return out
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Ignored exception: {e}")
                 # fallback without signature
                 try:
                     out["ddl"] = fetch_one_val(
@@ -627,18 +740,20 @@ def list_views(conn, db: str, schema: str) -> list[str]:
             views = [r[i_name] for r in rows if len(r) > i_name and r[i_name]]
             if views:
                 return views
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         pass
 
     # Fallback to INFORMATION_SCHEMA
     try:
         cols, rows = exec_sql_with_cols(
             conn,
-            f"SELECT VIEW_NAME FROM {db}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{schema.upper()}'",
+            f"SELECT TABLE_NAME FROM {db}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{schema.upper()}'",
         )
         if rows:
             return [r[0] for r in rows if r[0]]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         pass
 
     return []
@@ -649,7 +764,8 @@ def get_view_ddl(conn, db: str, schema: str, view_name: str) -> Optional[str]:
         return fetch_one_val(
             conn, "SELECT GET_DDL('VIEW', %s, TRUE)", (f"{db}.{schema}.{view_name}",)
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         return None
 
 
@@ -764,8 +880,8 @@ def is_iceberg_table(conn, db: str, schema: str, table: str) -> bool:
             if len(r) > 1 and r[1] == table:
                 if len(r) > 5 and r[5] and "ICEBERG" in str(r[5]).upper():
                     return True
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
     return False
 
 
@@ -786,7 +902,8 @@ def get_stage_ddl(conn, db: str, schema: str, stage_name: str) -> Optional[str]:
             "SELECT GET_DDL('STAGE', %s, TRUE)",
             (f"{db}.{schema}.{stage_name}",),
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         return None
 
 
@@ -827,7 +944,8 @@ def get_cortex_search_service_info(
             conn,
             "SHOW CORTEX SEARCH SERVICES",
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         return None
 
     col_map = {c.lower(): i for i, c in enumerate(cols)}
@@ -861,7 +979,8 @@ def get_cortex_search_service_info(
                     if len(dr) >= 2 and dr[0]:
                         key = str(dr[0]).lower()
                         info[key] = dr[1]
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Ignored exception: {e}")
                 pass
             return info
     return None

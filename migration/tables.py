@@ -1,7 +1,21 @@
+import logging
+
+logger = (
+    logging.logger(__name__)
+    if hasattr(logging, "logger")
+    else logging.getLogger(__name__)
+)
 import re
-from connection import exec_sql, fetch_one_val
+from connection import exec_sql, exec_sql_with_cols, fetch_one_val
 from discovery import get_table_columns, is_iceberg_table
-from utils import fq, stage_loc_literal, sql_string_literal, qident, rewrite_db_in_ddl
+from utils import (
+    fq,
+    stage_loc_literal,
+    sql_string_literal,
+    qident,
+    rewrite_db_in_ddl,
+    _find_col,
+)
 
 
 # --- FK discovery + ordering (copied from mainv2 to restore default FK-aware ordering) ---
@@ -11,8 +25,8 @@ def get_foreign_keys(conn, db: str, schema: str) -> dict:
     """
     try:
         exec_sql(conn, f"USE DATABASE {qident(db)}")
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
 
     sql = """
         SELECT 
@@ -34,7 +48,8 @@ def get_foreign_keys(conn, db: str, schema: str) -> dict:
     """
     try:
         rows = exec_sql(conn, sql, (schema,))
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         return {}
 
     fk_graph = {}
@@ -124,7 +139,8 @@ def migrate_table_ddls(
         table_names = [r[1] for r in tables if len(r) > 1]
         if table_names:
             pass  # Got tables successfully
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         table_names = []
 
     # Fallback to INFORMATION_SCHEMA if SHOW TABLES returned nothing
@@ -135,7 +151,8 @@ def migrate_table_ddls(
                 f"SELECT TABLE_NAME FROM {src_db}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema.upper()}' AND TABLE_TYPE = 'BASE TABLE'",
             )
             table_names = [r[0] for r in rows if r[0]]
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Ignored exception: {e}")
             table_names = []
 
     # Exclude dynamic tables - they will be migrated in DYNAMIC_TABLES phase
@@ -145,7 +162,8 @@ def migrate_table_ddls(
         )
         dynamic_names = {r[1] for r in dynamic_tables if len(r) > 1}
         table_names = [t for t in table_names if t not in dynamic_names]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         pass  # No dynamic tables or error
 
     if not table_names:
@@ -191,10 +209,68 @@ def migrate_table_data_ordered(
     stage_ref: str,
     run_id: str,
     dry_run: bool = False,
+    tgt_warehouse: str = None,
 ) -> dict:
     """Migrate table data with FK-aware ordering. Skips Dynamic Tables (they have no data)."""
-    tables = exec_sql(src_conn, f"SHOW TABLES IN SCHEMA {fq(src_db, schema)}")
-    table_names = [r[1] for r in tables if len(r) > 1]
+    # Get warehouse from source or target (required for COPY INTO)
+    # Try source first, then target
+    wh = tgt_warehouse
+    if not wh:
+        for conn, name in [(src_conn, "source"), (tgt_conn, "target")]:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT CURRENT_WAREHOUSE()")
+                w = cur.fetchone()
+                if w and w[0]:
+                    wh = w[0]
+                    logger.info(f"Auto-detected {name} warehouse: {wh}")
+                    break
+            except Exception as e:
+                logger.warning(f"Failed to detect {name} warehouse: {e}")
+
+    if wh:
+        # Apply to both connections for the unload/load operations
+        exec_sql(tgt_conn, f"USE WAREHOUSE {wh}")
+        exec_sql(src_conn, f"USE WAREHOUSE {wh}")
+    else:
+        logger.error("No warehouse available - COPY INTO will fail")
+    cols, tables = exec_sql_with_cols(
+        src_conn, f"SHOW TABLES IN SCHEMA {fq(src_db, schema)}"
+    )
+
+    i_name = _find_col(cols, "name")
+    i_is_external = _find_col(cols, "is_external")
+    i_rows = _find_col(cols, "rows")
+
+    if i_name is None:
+        table_names = [r[1] for r in tables if len(r) > 1]
+    else:
+        table_names = [r[i_name] for r in tables]
+
+    # Pre-compute iceberg and external tables, and grab row counts
+    skip_tables = set()
+    src_row_counts = {}
+    for r in tables:
+        if i_name is None or len(r) <= i_name:
+            continue
+        name = r[i_name]
+
+        if i_rows is not None and len(r) > i_rows:
+            try:
+                src_row_counts[name] = int(r[i_rows])
+            except:
+                src_row_counts[name] = None
+
+        # Check for EXTERNAL
+        if i_is_external is not None and len(r) > i_is_external:
+            if str(r[i_is_external]).upper() == "Y":
+                skip_tables.add(name)
+                continue
+
+        # Check for ICEBERG across all columns (since SHOW TABLES structure can vary)
+        row_str = " ".join(str(c).upper() for c in r if c is not None)
+        if "ICEBERG" in row_str:
+            skip_tables.add(name)
 
     # Exclude dynamic tables - they have no data to copy
     dynamic_tables = exec_sql(
@@ -204,14 +280,30 @@ def migrate_table_data_ordered(
     table_names = [t for t in table_names if t not in dynamic_names]
 
     if not table_names:
-        return {"migrated": 0, "errors": []}
+        return {"migrated": 0, "errors": [], "validation": []}
+
+    # Pre-fetch all columns for all tables in the schema (O(1) query instead of O(N) DESC TABLE)
+    all_columns: dict[str, list[str]] = {}
+    try:
+        col_rows = exec_sql(
+            src_conn,
+            f"SELECT TABLE_NAME, COLUMN_NAME FROM {src_db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{schema.upper()}' ORDER BY ORDINAL_POSITION",
+        )
+        for r in col_rows:
+            tname, cname = r[0], r[1]
+            if tname not in all_columns:
+                all_columns[tname] = []
+            all_columns[tname].append(cname)
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
+        pass
 
     # --- Restore FK-aware ordering (default: always on) ---
     try:
         fk_graph = get_foreign_keys(src_conn, src_db, schema)
         ordered_tables = resolve_table_data_order(table_names, fk_graph)
-    except Exception:
-        # If FK discovery fails for any reason, fall back to the raw list
+    except Exception as e:
+        logger.warning(f"Ignored exception: {e}")
         ordered_tables = table_names
 
     errors = []
@@ -219,19 +311,20 @@ def migrate_table_data_ordered(
     validation_results = []
 
     for t in ordered_tables:
-        cols = get_table_columns(src_conn, src_db, schema, t)
+        if t in skip_tables:
+            errors.append(f"{t}: Skipped (Iceberg or External table)")
+            continue
+
+        # Use pre-fetched columns, or fallback to DESC TABLE if missing
+        cols = all_columns.get(t)
+        if not cols:
+            cols = get_table_columns(src_conn, src_db, schema, t)
+
         if not cols:
             continue
 
-        # Get source row count before migration
-        src_count = None
-        try:
-            src_count = exec_sql(
-                src_conn, f"SELECT COUNT(*) FROM {fq(src_db, schema, t)}"
-            )
-            src_count = src_count[0][0] if src_count else None
-        except Exception:
-            pass
+        # Get source row count before migration from SHOW TABLES metadata
+        src_count = src_row_counts.get(t)
 
         path = f"data/{run_id}/{src_db}/{schema}/{t}/"
         unload_path = f"{stage_ref}/{path}"
@@ -253,7 +346,8 @@ def migrate_table_data_ordered(
                         tgt_conn, f"SELECT COUNT(*) FROM {fq(tgt_db, tgt_schema, t)}"
                     )
                     tgt_count = tgt_count[0][0] if tgt_count else None
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Ignored exception: {e}")
                     pass
 
                 if (

@@ -10,9 +10,12 @@ from connection import connect_sf, exec_sql
 
 # Global connection cache
 # Key: SHA256 of (account, user, password, role, warehouse)
-# Value: connection object
-_CONN_CACHE: dict[str, object] = {}
+# Value: dict with 'conn': connection object, 'lock': threading.Lock, 'last_used': timestamp
+import time
+
+_CONN_CACHE: dict[str, dict] = {}
 _CONN_LOCK = threading.Lock()
+MAX_CACHE_SIZE = 20
 
 
 def _get_cache_key(payload) -> str:
@@ -20,28 +23,42 @@ def _get_cache_key(payload) -> str:
     return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
 
+def _evict_oldest():
+    if len(_CONN_CACHE) > MAX_CACHE_SIZE:
+        oldest_key = min(_CONN_CACHE.keys(), key=lambda k: _CONN_CACHE[k]["last_used"])
+        entry = _CONN_CACHE.pop(oldest_key, None)
+        if entry and entry["conn"]:
+            try:
+                entry["conn"].close()
+            except Exception:
+                pass
+
+
 @contextmanager
 def snowflake_connection(payload):
     key = _get_cache_key(payload)
-    conn = None
+    entry = None
 
     with _CONN_LOCK:
-        conn = _CONN_CACHE.get(key)
+        entry = _CONN_CACHE.get(key)
+        if entry is not None:
+            entry["last_used"] = time.time()
 
-    if conn is not None:
-        # Verify if connection is still alive outside the global lock
-        try:
-            exec_sql(conn, "SELECT 1")
-        except Exception:
+    if entry is not None:
+        # Acquire the per-connection lock to prevent concurrent queries on the same connection
+        with entry["lock"]:
             try:
-                conn.close()
+                exec_sql(entry["conn"], "SELECT 1")
             except Exception:
-                pass
-            conn = None
-            with _CONN_LOCK:
-                _CONN_CACHE.pop(key, None)
+                try:
+                    entry["conn"].close()
+                except Exception:
+                    pass
+                with _CONN_LOCK:
+                    _CONN_CACHE.pop(key, None)
+                entry = None
 
-    if conn is None:
+    if entry is None:
         conn = connect_sf(
             payload.account,
             payload.user,
@@ -50,13 +67,16 @@ def snowflake_connection(payload):
             warehouse=payload.warehouse,
             passcode=payload.passcode,
         )
+        entry = {"conn": conn, "lock": threading.RLock(), "last_used": time.time()}
         with _CONN_LOCK:
-            _CONN_CACHE[key] = conn
+            _CONN_CACHE[key] = entry
+            _evict_oldest()
 
-    try:
-        # Yield the connection to the caller
-        yield conn
-    finally:
-        # Do not close the connection so it can be reused across API calls.
-        # This keeps the MFA session alive.
-        pass
+    # Hold the connection lock while yielding so no other thread can execute queries concurrently
+    with entry["lock"]:
+        try:
+            yield entry["conn"]
+        finally:
+            # Do not close the connection so it can be reused across API calls.
+            # This keeps the MFA session alive.
+            pass

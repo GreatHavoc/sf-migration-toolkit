@@ -53,6 +53,11 @@ def list_databases_route(payload: ListDatabasesRequest) -> ListDatabasesResponse
                 db_names = [
                     row[i_name] for row in rows if len(row) > i_name and row[i_name]
                 ]
+
+            if not db_names:
+                raise ValueError(
+                    "No databases found or accessible. Check your role privileges."
+                )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

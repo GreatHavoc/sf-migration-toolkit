@@ -10,7 +10,7 @@ backend/data/*
 backend/runtime/*
 !backend/runtime/.gitkeep
 checkpoint_*.json
-
+checkpoints/
 # Frontend build artifacts
 frontend/node_modules/
 frontend/.next/
